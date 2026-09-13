@@ -1,7 +1,11 @@
 import {
+	createReference,
 	dependencies,
 	duration,
+	getReference,
 	type Plan,
+	type Reference,
+	referenceBrand,
 	resolve,
 	type Step,
 	validate,
@@ -22,6 +26,91 @@ function snapshot(
 		...(error ? { error } : {}),
 		nodes: Object.fromEntries(nodes),
 	}
+}
+
+function remapMapValue(
+	value: unknown,
+	item: unknown,
+	index: number,
+	ids: ReadonlyMap<string, string>,
+): unknown {
+	const reference = getReference(value)
+	if (reference) {
+		const { nodeId, path } = reference[referenceBrand]
+		if (nodeId === '$map:item')
+			return path.reduce<unknown>(
+				(current, property) =>
+					current === null || current === undefined
+						? undefined
+						: (current as Record<PropertyKey, unknown>)[property],
+				item,
+			)
+		if (nodeId === '$map:index') return index
+		const id = ids.get(nodeId)
+		return id ? createReference(id, path) : value
+	}
+	if (Array.isArray(value))
+		return value.map((entry) => remapMapValue(entry, item, index, ids))
+	if (
+		typeof value !== 'object' ||
+		value === null ||
+		(Object.getPrototypeOf(value) !== Object.prototype &&
+			Object.getPrototypeOf(value) !== null)
+	)
+		return value
+	return Object.fromEntries(
+		Object.entries(value).map(([key, entry]) => [
+			key,
+			remapMapValue(entry, item, index, ids),
+		]),
+	)
+}
+
+function expandMap(
+	map: Plan['maps'][number],
+	items: readonly unknown[],
+): Step[] {
+	const expanded: Step[] = []
+	const results: Reference[] = []
+	for (const [index, item] of items.entries()) {
+		const ids = new Map(
+			map.steps.map((step) => [step.id, `${map.id}[${index}].${step.id}`]),
+		)
+		for (const step of map.steps) {
+			const id = ids.get(step.id)
+			if (!id) continue
+			expanded.push({
+				...step,
+				id,
+				map: {
+					id: map.id,
+					...(map.concurrency === undefined
+						? {}
+						: { concurrency: map.concurrency }),
+				},
+				input: remapMapValue(step.input, item, index, ids),
+				conditions: step.conditions.map((condition) => ({
+					...condition,
+					value: remapMapValue(condition.value, item, index, ids) as Reference,
+				})),
+			})
+		}
+		const result = getReference(remapMapValue(map.result, item, index, ids))
+		if (!result)
+			throw new Error(`map "${map.id}" produced an invalid item result.`)
+		results.push(result)
+	}
+	expanded.push({
+		id: map.id,
+		node: {
+			id: map.id,
+			retry: false,
+			run: ({ input }) => input,
+		},
+		input: results,
+		conditions: [],
+	})
+	return expanded
 }
 
 function isSelected(
@@ -113,14 +202,36 @@ export async function executePlan(
 	const outputs = new Map<string, unknown>()
 	const remaining = new Set(plan.steps.map((step) => step.id))
 	const byId = new Map(plan.steps.map((step) => [step.id, step]))
+	const remainingMaps = new Map(plan.maps.map((map) => [map.id, map]))
 	const publish = async (status: RunSnapshot['status'] = 'running') =>
 		update(snapshot(id, status, nodes))
 	await publish()
 
 	try {
 		outputs.set('$input', await validate(plan.input, input))
-		while (remaining.size > 0) {
+		while (remaining.size > 0 || remainingMaps.size > 0) {
 			if (signal.aborted) throw new DOMException('Run cancelled', 'AbortError')
+			for (const [mapId, map] of remainingMaps) {
+				if (
+					![...dependencies(map.items)].every(
+						(dependency) =>
+							dependency === '$input' ||
+							nodes.get(dependency)?.status === 'completed',
+					)
+				)
+					continue
+				const items = resolve(map.items, outputs)
+				if (!Array.isArray(items))
+					throw new TypeError(`map "${mapId}" source must resolve to an array.`)
+				remainingMaps.delete(mapId)
+				for (const step of expandMap(map, items)) {
+					if (byId.has(step.id))
+						throw new Error(`map "${mapId}" generated a duplicate step ID.`)
+					byId.set(step.id, step)
+					remaining.add(step.id)
+					nodes.set(step.id, { status: 'pending', attempts: 0 })
+				}
+			}
 			const ready = [...remaining]
 				.map((stepId) => byId.get(stepId))
 				.filter((step): step is Step => Boolean(step))
@@ -138,10 +249,18 @@ export async function executePlan(
 							nodes.get(dependency)?.status === 'completed',
 					),
 				)
-			if (ready.length === 0)
+			const mapSlots = new Map<string, number>()
+			const limitedReady = ready.filter((step) => {
+				if (!step.map?.concurrency) return true
+				const count = mapSlots.get(step.map.id) ?? 0
+				if (count >= step.map.concurrency) return false
+				mapSlots.set(step.map.id, count + 1)
+				return true
+			})
+			if (limitedReady.length === 0)
 				throw new Error('Flow graph has unresolved or circular dependencies.')
 			const completed = await Promise.allSettled(
-				ready.map(async (step) => {
+				limitedReady.map(async (step) => {
 					remaining.delete(step.id)
 					if (!isSelected(step, outputs)) {
 						nodes.set(step.id, { status: 'skipped', attempts: 0 })

@@ -157,6 +157,81 @@ test('selects the first matching predicate branch and supports switch', async ()
 	expect(result.nodes.hot?.status).toBe('skipped')
 })
 
+test('maps runtime output into typed fan-out and ordered fan-in', async () => {
+	const findCompanies = defineNode<undefined, { id: string }[]>({
+		id: 'find-companies',
+		run: () => [{ id: '1' }, { id: '2' }, { id: '3' }],
+	})
+	const enrichCompany = defineNode<
+		{ companyId: string },
+		{ id: string; name: string }
+	>({
+		id: 'enrich-company',
+		run: ({ input }) => ({
+			id: input.companyId,
+			name: `Company ${input.companyId}`,
+		}),
+	})
+	const report = defineNode<
+		{ companies: { id: string; name: string }[] },
+		string
+	>({
+		id: 'report',
+		run: ({ input }) => input.companies.map((company) => company.id).join(','),
+	})
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: { findCompanies, enrichCompany, report },
+	})
+	const flow = flows.defineFlow<undefined, string>({
+		id: 'map-companies',
+		flow: ({ node, map }) => {
+			const companies = node(findCompanies, undefined)
+			const enriched = map(companies, (company) =>
+				node(enrichCompany, { companyId: company.id }),
+			)
+			return node(report, { companies: enriched })
+		},
+	})
+	const result = await (await flow.run(undefined)).wait()
+	expect(result.output).toBe('1,2,3')
+	expect(result.nodes['map-1[0].enrich-company']?.status).toBe('completed')
+	expect(result.nodes['map-1[2].enrich-company']?.output).toEqual({
+		id: '3',
+		name: 'Company 3',
+	})
+})
+
+test('limits map concurrency', async () => {
+	let active = 0
+	let maximum = 0
+	const values = defineNode<undefined, number[]>({
+		id: 'values',
+		run: () => [1, 2, 3, 4],
+	})
+	const work = defineNode<number, number>({
+		id: 'work',
+		run: async ({ input }) => {
+			active++
+			maximum = Math.max(maximum, active)
+			await new Promise((resolve) => setTimeout(resolve, 5))
+			active--
+			return input
+		},
+	})
+	const flows = betterFlows({ runtime: memory(), nodes: { values, work } })
+	const flow = flows.defineFlow<undefined, number[]>({
+		id: 'map-concurrency',
+		flow: ({ node, map }) =>
+			map(node(values, undefined), (value) => node(work, value), {
+				concurrency: 2,
+			}),
+	})
+	const result = await (await flow.run(undefined)).wait()
+	expect(result.output).toEqual([1, 2, 3, 4])
+	expect(maximum).toBe(2)
+})
+
 test('retries transient node failures', async () => {
 	let attempts = 0
 	const flaky = defineNode<undefined, string>({

@@ -7,6 +7,7 @@ export interface Reference {
 		readonly path: readonly PropertyKey[]
 	}
 }
+
 export interface RuntimeNode {
 	readonly id?: string
 	readonly input?: Schema
@@ -25,6 +26,7 @@ export interface RuntimeNode {
 		}
 	}) => unknown | Promise<unknown>
 }
+
 export interface Step {
 	readonly id: string
 	readonly node: RuntimeNode
@@ -36,11 +38,21 @@ export interface Step {
 		readonly predicate?: (value: unknown) => boolean
 		readonly previousPredicates?: readonly ((value: unknown) => boolean)[]
 	}[]
+	readonly map?: { readonly id: string; readonly concurrency?: number }
+}
+
+export interface MapStep {
+	readonly id: string
+	readonly items: unknown
+	readonly steps: readonly Step[]
+	readonly result: unknown
+	readonly concurrency?: number
 }
 export interface Plan {
 	readonly id: string
 	readonly input?: Schema
 	readonly output?: Schema
 	readonly steps: readonly Step[]
+	readonly maps: readonly MapStep[]
 	readonly result: unknown
 }

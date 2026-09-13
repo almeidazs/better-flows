@@ -94,6 +94,26 @@ when(qualification.score, ({ value }) => value >= 80, () => {
 `branch()` chooses the first matching predicate. Nodes in unselected paths are
 recorded as `skipped` in the run snapshot.
 
+## Dynamic fan-out
+
+Use `map()` when the number of nodes depends on runtime data. Its result keeps
+the source order, so it can be passed directly into a fan-in node.
+
+```ts
+const companies = node(findRelatedCompanies, { leadId: input.leadId })
+
+const enriched = map(
+	companies.items,
+	(company) => node(enrichCompany, { companyId: company.id }),
+	{ concurrency: 5 },
+)
+
+return node(generateReport, { companies: enriched })
+```
+
+The callback may define a small per-item flow and must return its final node
+output. Without `concurrency`, every ready item runs in parallel.
+
 ## Runtimes
 
 - [Memory](src/runtimes/memory/README.md) — fast, process-local execution for tests and development.

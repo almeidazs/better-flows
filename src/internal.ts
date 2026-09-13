@@ -5,7 +5,13 @@ export const nodeBrand = Symbol('better-flows.node')
 export const flowBrand = Symbol('better-flows.flow')
 export const referenceBrand = Symbol('better-flows.reference')
 
-export type { Plan, Reference, RuntimeNode, Step } from './types/internal'
+export type {
+	MapStep,
+	Plan,
+	Reference,
+	RuntimeNode,
+	Step,
+} from './types/internal'
 
 export function createReference(
 	nodeId: string,

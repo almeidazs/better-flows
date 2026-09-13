@@ -5,6 +5,7 @@ import {
 	type Plan,
 	type Reference,
 	type RuntimeNode,
+	type Step,
 } from '../internal'
 import type { AnyNode, NodeInput, NodeOutput } from '../nodes'
 import type { RunSnapshot } from '../runtimes'
@@ -46,6 +47,12 @@ export interface FlowBuilder {
 		predicate: (arguments_: { readonly value: TValue }) => boolean,
 		callback: () => void,
 	): void
+	/** Expands a typed mini-flow once for every item resolved at runtime. */
+	map<TItem, TResult>(
+		items: readonly TItem[],
+		callback: (item: TItem, index: number) => TResult,
+		options?: { readonly concurrency?: number },
+	): TResult[]
 }
 
 /** Declarative definition of a typed workflow. */
@@ -82,16 +89,16 @@ export interface RunHandle<TOutput> {
 export function compileFlow<TInput, TOutput>(
 	definition: FlowDefinition<TInput, TOutput>,
 ): CompiledFlow<TInput, TOutput> {
-	const steps: {
+	const steps: Step[] = []
+	const maps: {
 		id: string
-		node: RuntimeNode
-		input: unknown
-		conditions: readonly {
-			value: Reference
-			expected: unknown
-			otherwise?: readonly PropertyKey[]
-		}[]
+		items: unknown
+		steps: readonly Step[]
+		result: unknown
+		concurrency?: number
 	}[] = []
+	let activeSteps = steps
+	let mapDepth = 0
 	type Condition = {
 		value: Reference
 		expected: unknown
@@ -105,12 +112,13 @@ export function compileFlow<TInput, TOutput>(
 		input: createReference('$input') as TInput,
 		node(node, input) {
 			const baseId =
-				(node as { readonly id?: string }).id ?? `node-${steps.length + 1}`
-			const occurrence = steps.filter(
+				(node as { readonly id?: string }).id ??
+				`node-${activeSteps.length + 1}`
+			const occurrence = activeSteps.filter(
 				(step) => step.id === baseId || step.id.startsWith(`${baseId}#`),
 			).length
 			const id = occurrence === 0 ? baseId : `${baseId}#${occurrence + 1}`
-			steps.push({
+			activeSteps.push({
 				id,
 				node: node as unknown as RuntimeNode,
 				input,
@@ -209,6 +217,48 @@ export function compileFlow<TInput, TOutput>(
 			callback()
 			conditions = parent
 		},
+		map(items, callback, options) {
+			if (mapDepth > 0)
+				throw new TypeError('map() cannot be nested inside another map().')
+			if (!getReference(items))
+				throw new TypeError(
+					'map() requires a flow input or node output reference.',
+				)
+			if (
+				options?.concurrency !== undefined &&
+				(!Number.isSafeInteger(options.concurrency) || options.concurrency < 1)
+			)
+				throw new TypeError('map().concurrency must be a positive integer.')
+			const template: Step[] = []
+			const parentSteps = activeSteps
+			activeSteps = template
+			mapDepth++
+			let result: unknown
+			try {
+				result = callback(
+					createReference('$map:item') as never,
+					createReference('$map:index') as never,
+				)
+			} finally {
+				mapDepth--
+				activeSteps = parentSteps
+			}
+			if (!getReference(result))
+				throw new TypeError(
+					'map() callback must return a node output reference.',
+				)
+			const id = `map-${maps.length + 1}`
+			maps.push({
+				id,
+				items,
+				steps: template,
+				result,
+				...(options?.concurrency === undefined
+					? {}
+					: { concurrency: options.concurrency }),
+			})
+			return createReference(id) as never
+		},
 	}
 	const result = definition.flow(builder)
 	const plan: Plan = {
@@ -216,6 +266,7 @@ export function compileFlow<TInput, TOutput>(
 		...(definition.input ? { input: definition.input } : {}),
 		...(definition.output ? { output: definition.output } : {}),
 		steps,
+		maps,
 		result,
 	}
 	return {
