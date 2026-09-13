@@ -203,13 +203,81 @@ export async function executePlan(
 	const remaining = new Set(plan.steps.map((step) => step.id))
 	const byId = new Map(plan.steps.map((step) => [step.id, step]))
 	const remainingMaps = new Map(plan.maps.map((map) => [map.id, map]))
+	const active = new Map<Promise<void>, Step>()
+	const activeMaps = new Map<string, number>()
 	const publish = async (status: RunSnapshot['status'] = 'running') =>
 		update(snapshot(id, status, nodes))
 	await publish()
+	const runStep = async (step: Step) => {
+		if (!isSelected(step, outputs)) {
+			nodes.set(step.id, { status: 'skipped', attempts: 0 })
+			return
+		}
+		const retry = retryPolicy(step)
+		let lastError: unknown
+		for (let attempt = 1; attempt <= retry.attempts; attempt++) {
+			if (signal.aborted) throw new DOMException('Run cancelled', 'AbortError')
+			nodes.set(step.id, { status: 'running', attempts: attempt })
+			await publish()
+			const controller = new AbortController()
+			signal.addEventListener('abort', () => controller.abort(), {
+				once: true,
+			})
+			if (signal.aborted) controller.abort()
+			try {
+				const nodeContext = {
+					...context,
+					flowId: plan.id,
+					nodeId: step.id,
+					runId: id,
+					signal: controller.signal,
+				}
+				await onNodeStart?.(nodeContext)
+				const run = Promise.resolve(
+					step.node.run({
+						input: await validate(
+							step.node.input,
+							resolve(step.input, outputs),
+						),
+						ctx: nodeContext,
+					}),
+				)
+				const output = await withTimeout(
+					run,
+					step.node.timeout,
+					controller,
+					step.id,
+				)
+				const validatedOutput = await validate(step.node.output, output)
+				outputs.set(step.id, validatedOutput)
+				nodes.set(step.id, {
+					status: 'completed',
+					attempts: attempt,
+					output: validatedOutput,
+				})
+				return
+			} catch (error) {
+				lastError = error
+				if (signal.aborted) throw error
+				if (controller.signal.aborted) break
+				if (attempt < retry.attempts)
+					await sleep(
+						(retry.backoff === 'exponential' ? 2 ** (attempt - 1) : 1) * 1_000,
+						signal,
+					)
+			}
+		}
+		nodes.set(step.id, {
+			status: 'failed',
+			attempts: retry.attempts,
+			error: lastError instanceof Error ? lastError.message : String(lastError),
+		})
+		throw lastError
+	}
 
 	try {
 		outputs.set('$input', await validate(plan.input, input))
-		while (remaining.size > 0 || remainingMaps.size > 0) {
+		while (remaining.size > 0 || remainingMaps.size > 0 || active.size > 0) {
 			if (signal.aborted) throw new DOMException('Run cancelled', 'AbortError')
 			for (const [mapId, map] of remainingMaps) {
 				if (
@@ -249,7 +317,7 @@ export async function executePlan(
 							nodes.get(dependency)?.status === 'completed',
 					),
 				)
-			const mapSlots = new Map<string, number>()
+			const mapSlots = new Map(activeMaps)
 			const limitedReady = ready.filter((step) => {
 				if (!step.map?.concurrency) return true
 				const count = mapSlots.get(step.map.id) ?? 0
@@ -257,87 +325,35 @@ export async function executePlan(
 				mapSlots.set(step.map.id, count + 1)
 				return true
 			})
-			if (limitedReady.length === 0)
+			if (limitedReady.length === 0 && active.size === 0)
 				throw new Error('Flow graph has unresolved or circular dependencies.')
-			const completed = await Promise.allSettled(
-				limitedReady.map(async (step) => {
-					remaining.delete(step.id)
-					if (!isSelected(step, outputs)) {
-						nodes.set(step.id, { status: 'skipped', attempts: 0 })
-						return
+			for (const step of limitedReady) {
+				remaining.delete(step.id)
+				const task = runStep(step)
+				active.set(task, step)
+				if (step.map?.concurrency)
+					activeMaps.set(step.map.id, (activeMaps.get(step.map.id) ?? 0) + 1)
+			}
+			const settled = await Promise.race(
+				[...active].map(async ([task, step]) => {
+					try {
+						await task
+						return { task, step }
+					} catch (error) {
+						return { task, step, error }
 					}
-					const retry = retryPolicy(step)
-					let lastError: unknown
-					for (let attempt = 1; attempt <= retry.attempts; attempt++) {
-						if (signal.aborted)
-							throw new DOMException('Run cancelled', 'AbortError')
-						nodes.set(step.id, { status: 'running', attempts: attempt })
-						await publish()
-						const controller = new AbortController()
-						signal.addEventListener('abort', () => controller.abort(), {
-							once: true,
-						})
-						if (signal.aborted) controller.abort()
-						try {
-							const nodeContext = {
-								...context,
-								flowId: plan.id,
-								nodeId: step.id,
-								runId: id,
-								signal: controller.signal,
-							}
-							await onNodeStart?.(nodeContext)
-							const run = Promise.resolve(
-								step.node.run({
-									input: await validate(
-										step.node.input,
-										resolve(step.input, outputs),
-									),
-									ctx: nodeContext,
-								}),
-							)
-							const output = await withTimeout(
-								run,
-								step.node.timeout,
-								controller,
-								step.id,
-							)
-							const validatedOutput = await validate(step.node.output, output)
-							outputs.set(step.id, validatedOutput)
-							nodes.set(step.id, {
-								status: 'completed',
-								attempts: attempt,
-								output: validatedOutput,
-							})
-							return
-						} catch (error) {
-							lastError = error
-							if (signal.aborted) throw error
-							if (controller.signal.aborted) break
-							if (attempt < retry.attempts)
-								await sleep(
-									(retry.backoff === 'exponential' ? 2 ** (attempt - 1) : 1) *
-										1_000,
-									signal,
-								)
-						}
-					}
-					nodes.set(step.id, {
-						status: 'failed',
-						attempts: retry.attempts,
-						error:
-							lastError instanceof Error
-								? lastError.message
-								: String(lastError),
-					})
-					throw lastError
 				}),
 			)
-			const failure = completed.find(
-				(result): result is PromiseRejectedResult =>
-					result.status === 'rejected',
-			)
-			if (failure) throw failure.reason
+			active.delete(settled.task)
+			if (settled.step.map?.concurrency) {
+				const count = (activeMaps.get(settled.step.map.id) ?? 1) - 1
+				if (count === 0) activeMaps.delete(settled.step.map.id)
+				else activeMaps.set(settled.step.map.id, count)
+			}
+			if ('error' in settled) {
+				await Promise.allSettled([...active.keys()])
+				throw settled.error
+			}
 			await publish()
 		}
 		const output = await validate(plan.output, resolve(plan.result, outputs))

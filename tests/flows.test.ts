@@ -374,6 +374,50 @@ test('runs independent nodes concurrently and supports when()', async () => {
 	expect(result.nodes['second#2']?.status).toBe('completed')
 })
 
+test('starts dependants as soon as their own dependency completes', async () => {
+	const events: string[] = []
+	const slow = defineNode<undefined, string>({
+		id: 'slow',
+		run: async () => {
+			events.push('slow:start')
+			await new Promise((resolve) => setTimeout(resolve, 20))
+			events.push('slow:end')
+			return 'slow'
+		},
+	})
+	const fast = defineNode<undefined, string>({
+		id: 'fast',
+		run: async () => {
+			await new Promise((resolve) => setTimeout(resolve, 2))
+			events.push('fast:end')
+			return 'fast'
+		},
+	})
+	const dependant = defineNode<string, string>({
+		id: 'dependant',
+		run: ({ input }) => {
+			events.push('dependant:start')
+			return input
+		},
+	})
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: { slow, fast, dependant },
+	})
+	const flow = flows.defineFlow<undefined, undefined>({
+		id: 'event-driven-parallelism',
+		flow: ({ node }) => {
+			node(slow, undefined)
+			node(dependant, node(fast, undefined))
+			return undefined
+		},
+	})
+	await (await flow.run(undefined)).wait()
+	expect(events.indexOf('dependant:start')).toBeLessThan(
+		events.indexOf('slow:end'),
+	)
+})
+
 test('cancels a cooperative running node', async () => {
 	const waiting = defineNode<undefined, string>({
 		id: 'waiting',
