@@ -55,10 +55,10 @@ const qualifyLead = flows.defineFlow({
 	id: 'qualify-lead',
 	input: z.object({ leadId: z.string() }),
 	flow: ({ input, node }) => {
-    		const lead = node(fetchLead, input)
-      	const scored = node(scoreLead, { leadId: lead.leadId })
+		const lead = node(fetchLead, input)
+		const scored = node(scoreLead, { leadId: lead.leadId })
 
-        	return node(sendEmail, { email: lead.email, score: scored.score })
+		return node(sendEmail, { email: lead.email, score: scored.score })
   	},
 })
 
@@ -69,6 +69,30 @@ const result = await run.wait()
 
 `scored.score` is known as a number. `scored.foo` is a TypeScript error before
 the workflow executes.
+
+## Conditional paths
+
+Use `when()` for one runtime predicate, `branch()` for ordered predicates, and
+`switch()` for literal string values.
+
+```ts
+branch(qualification.score, {
+	hot: ({ value }) => value >= 80,
+	warm: ({ value }) => value >= 40,
+	cold: () => true,
+}, {
+	hot: () => node(notifySalesImmediately, { leadId: input.leadId }),
+	warm: () => node(addToNurturing, { leadId: input.leadId }),
+	cold: () => node(archiveLead, { leadId: input.leadId }),
+})
+
+when(qualification.score, ({ value }) => value >= 80, () => {
+	node(notifySalesImmediately, { leadId: input.leadId })
+})
+```
+
+`branch()` chooses the first matching predicate. Nodes in unselected paths are
+recorded as `skipped` in the run snapshot.
 
 ## Runtimes
 

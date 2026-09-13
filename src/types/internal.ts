@@ -33,6 +33,8 @@ export interface Step {
 		readonly value: Reference
 		readonly expected: unknown
 		readonly otherwise?: readonly PropertyKey[]
+		readonly predicate?: (value: unknown) => boolean
+		readonly previousPredicates?: readonly ((value: unknown) => boolean)[]
 	}[]
 }
 export interface Plan {

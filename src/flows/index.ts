@@ -24,8 +24,28 @@ export interface FlowBuilder {
 		value: TValue,
 		cases: Partial<Record<TValue | 'default', () => void>>,
 	): void
+	/** Declares ordered predicate-based paths for a node or input reference. */
+	branch<TValue, TCase extends string>(
+		value: TValue,
+		predicates: Record<
+			TCase,
+			(arguments_: { readonly value: TValue }) => boolean
+		>,
+		cases: Partial<Record<TCase, () => void>>,
+	): void
+	/** Declares literal string paths for a node or input reference. */
+	switch<TValue extends string>(
+		value: TValue,
+		cases: Partial<Record<TValue | 'default', () => void>>,
+	): void
 	/** Declares a path that runs only when a boolean reference is true. */
 	when(value: boolean, callback: () => void): void
+	/** Declares a path selected by a runtime predicate. */
+	when<TValue>(
+		value: TValue,
+		predicate: (arguments_: { readonly value: TValue }) => boolean,
+		callback: () => void,
+	): void
 }
 
 /** Declarative definition of a typed workflow. */
@@ -72,11 +92,15 @@ export function compileFlow<TInput, TOutput>(
 			otherwise?: readonly PropertyKey[]
 		}[]
 	}[] = []
-	let conditions: readonly {
+	type Condition = {
 		value: Reference
 		expected: unknown
 		otherwise?: readonly PropertyKey[]
-	}[] = []
+		predicate?: (value: unknown) => boolean
+		previousPredicates?: readonly ((value: unknown) => boolean)[]
+	}
+	type Cases = Record<string, (() => void) | undefined>
+	let conditions: readonly Condition[] = []
 	const builder: FlowBuilder & { input: TInput } = {
 		input: createReference('$input') as TInput,
 		node(node, input) {
@@ -97,13 +121,44 @@ export function compileFlow<TInput, TOutput>(
 		parallel(callback) {
 			return callback()
 		},
-		branch(value, cases) {
+		branch(
+			value: unknown,
+			predicatesOrCases:
+				| Cases
+				| Record<string, (arguments_: { readonly value: unknown }) => boolean>,
+			maybeCases?: Cases,
+		) {
 			const reference = getReference(value)
 			if (!reference)
 				throw new TypeError(
 					'branch() requires a node output or flow input reference.',
 				)
 			const parent = conditions
+			const cases = (maybeCases ?? predicatesOrCases) as Cases
+			if (maybeCases) {
+				const predicates = predicatesOrCases as Record<
+					string,
+					(arguments_: { readonly value: unknown }) => boolean
+				>
+				const previous: ((value: unknown) => boolean)[] = []
+				for (const [name, callback] of Object.entries(cases)) {
+					const predicate = predicates[name]
+					if (!callback || !predicate) continue
+					conditions = [
+						...parent,
+						{
+							value: reference,
+							expected: undefined,
+							predicate: (current) => predicate({ value: current }),
+							previousPredicates: [...previous],
+						},
+					]
+					callback()
+					previous.push((current) => predicate({ value: current }))
+				}
+				conditions = parent
+				return
+			}
 			const expectedValues = Object.keys(cases).filter(
 				(key) => key !== 'default',
 			)
@@ -119,14 +174,38 @@ export function compileFlow<TInput, TOutput>(
 			}
 			conditions = parent
 		},
-		when(value, callback) {
+		switch(value, cases) {
+			builder.branch(value, cases)
+		},
+		when(
+			value: unknown,
+			predicateOrCallback:
+				| (() => void)
+				| ((arguments_: { readonly value: unknown }) => boolean),
+			maybeCallback?: () => void,
+		) {
 			const reference = getReference(value)
 			if (!reference)
 				throw new TypeError(
 					'when() requires a node output or flow input reference.',
 				)
 			const parent = conditions
-			conditions = [...parent, { value: reference, expected: true }]
+			const predicate = maybeCallback
+				? (predicateOrCallback as (arguments_: {
+						readonly value: unknown
+					}) => boolean)
+				: undefined
+			const callback = (maybeCallback ?? predicateOrCallback) as () => void
+			conditions = [
+				...parent,
+				predicate
+					? {
+							value: reference,
+							expected: undefined,
+							predicate: (current) => predicate({ value: current }),
+						}
+					: { value: reference, expected: true },
+			]
 			callback()
 			conditions = parent
 		},

@@ -28,10 +28,20 @@ function isSelected(
 	step: Step,
 	outputs: ReadonlyMap<string, unknown>,
 ): boolean {
-	return step.conditions.every(({ value, expected, otherwise }) =>
-		otherwise
-			? !otherwise.includes(resolve(value, outputs) as PropertyKey)
-			: resolve(value, outputs) === expected,
+	return step.conditions.every(
+		({ value, expected, otherwise, predicate, previousPredicates }) => {
+			const resolved = resolve(value, outputs)
+
+			if (predicate)
+				return (
+					predicate(resolved) &&
+					!previousPredicates?.some((previous) => previous(resolved))
+				)
+
+			return otherwise
+				? !otherwise.includes(resolved as PropertyKey)
+				: resolved === expected
+		},
 	)
 }
 

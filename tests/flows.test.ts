@@ -132,6 +132,31 @@ test('uses the default branch when no explicit case matches', async () => {
 	expect(result.nodes.fallback?.status).toBe('completed')
 })
 
+test('selects the first matching predicate branch and supports switch', async () => {
+	const score = defineNode<undefined, number>({ id: 'score', run: () => 65 })
+	const warm = defineNode<undefined, string>({ id: 'warm', run: () => 'warm' })
+	const hot = defineNode<undefined, string>({ id: 'hot', run: () => 'hot' })
+	const flows = betterFlows({ runtime: memory(), nodes: { score, warm, hot } })
+	const flow = flows.defineFlow<undefined, undefined>({
+		id: 'predicate-branch',
+		flow: ({ node, branch }) => {
+			const value = node(score, undefined)
+			branch(
+				value,
+				{
+					hot: ({ value: current }) => current >= 80,
+					warm: ({ value: current }) => current >= 40,
+				},
+				{ hot: () => node(hot, undefined), warm: () => node(warm, undefined) },
+			)
+			return undefined
+		},
+	})
+	const result = await (await flow.run(undefined)).wait()
+	expect(result.nodes.warm?.status).toBe('completed')
+	expect(result.nodes.hot?.status).toBe('skipped')
+})
+
 test('retries transient node failures', async () => {
 	let attempts = 0
 	const flaky = defineNode<undefined, string>({
