@@ -2,6 +2,7 @@ import {
 	createReference,
 	dependencies,
 	duration,
+	type EngineHooks,
 	getReference,
 	type Plan,
 	type Reference,
@@ -26,6 +27,14 @@ function snapshot(
 		...(error ? { error } : {}),
 		nodes: Object.fromEntries(nodes),
 	}
+}
+
+function nodeRun(nodes: ReadonlyMap<string, NodeRun>, id: string): NodeRun {
+	const node = nodes.get(id)
+
+	if (!node) throw new Error(`Node "${id}" is not part of this execution.`)
+
+	return node
 }
 
 function remapMapValue(
@@ -102,6 +111,7 @@ function expandMap(
 	}
 	expanded.push({
 		id: map.id,
+		internal: true,
 		node: {
 			id: map.id,
 			retry: false,
@@ -194,7 +204,7 @@ export async function executePlan(
 	context: Record<string, unknown>,
 	update: (snapshot: RunSnapshot) => Promise<void> | void,
 	signal: AbortSignal,
-	onNodeStart?: (context: Record<string, unknown>) => Promise<void> | void,
+	hooks?: EngineHooks,
 ): Promise<RunSnapshot> {
 	const nodes = new Map<string, NodeRun>(
 		plan.steps.map((step) => [step.id, { status: 'pending', attempts: 0 }]),
@@ -209,8 +219,41 @@ export async function executePlan(
 		update(snapshot(id, status, nodes))
 	await publish()
 	const runStep = async (step: Step) => {
+		const nodeContext = {
+			...context,
+			flowId: plan.id,
+			nodeId: step.id,
+			runId: id,
+			signal,
+		}
+		const nodeInput = resolve(step.input, outputs)
+		const finish = async () => {
+			if (step.internal) return
+			await hooks?.onNodeFinish?.({
+				runId: id,
+				flowId: plan.id,
+				input,
+				ctx: context,
+				nodeId: step.id,
+				nodeInput,
+				nodeCtx: nodeContext,
+				node: nodeRun(nodes, step.id),
+			})
+		}
 		if (!isSelected(step, outputs)) {
 			nodes.set(step.id, { status: 'skipped', attempts: 0 })
+			if (!step.internal)
+				await hooks?.onNodeSkip?.({
+					runId: id,
+					flowId: plan.id,
+					input,
+					ctx: context,
+					nodeId: step.id,
+					nodeInput,
+					nodeCtx: nodeContext,
+					node: nodeRun(nodes, step.id),
+				})
+			await finish()
 			return
 		}
 		const retry = retryPolicy(step)
@@ -220,26 +263,34 @@ export async function executePlan(
 			nodes.set(step.id, { status: 'running', attempts: attempt })
 			await publish()
 			const controller = new AbortController()
+			const attemptContext = {
+				...context,
+				flowId: plan.id,
+				nodeId: step.id,
+				runId: id,
+				signal: controller.signal,
+			}
 			signal.addEventListener('abort', () => controller.abort(), {
 				once: true,
 			})
 			if (signal.aborted) controller.abort()
 			try {
-				const nodeContext = {
-					...context,
-					flowId: plan.id,
-					nodeId: step.id,
-					runId: id,
-					signal: controller.signal,
-				}
-				await onNodeStart?.(nodeContext)
+				if (!step.internal)
+					await hooks?.onNodeStart?.({
+						runId: id,
+						flowId: plan.id,
+						input,
+						ctx: context,
+						nodeId: step.id,
+						nodeInput,
+						nodeCtx: attemptContext,
+						attempt,
+						maxAttempts: retry.attempts,
+					})
 				const run = Promise.resolve(
 					step.node.run({
-						input: await validate(
-							step.node.input,
-							resolve(step.input, outputs),
-						),
-						ctx: nodeContext,
+						input: await validate(step.node.input, nodeInput),
+						ctx: attemptContext,
 					}),
 				)
 				const output = await withTimeout(
@@ -255,16 +306,59 @@ export async function executePlan(
 					attempts: attempt,
 					output: validatedOutput,
 				})
+				if (!step.internal)
+					await hooks?.onNodeComplete?.({
+						runId: id,
+						flowId: plan.id,
+						input,
+						ctx: context,
+						nodeId: step.id,
+						nodeInput,
+						nodeCtx: attemptContext,
+						node: nodeRun(nodes, step.id),
+						output: validatedOutput,
+					})
+				await finish()
 				return
 			} catch (error) {
 				lastError = error
 				if (signal.aborted) throw error
+				const willRetry = !controller.signal.aborted && attempt < retry.attempts
+				const delay =
+					(retry.backoff === 'exponential' ? 2 ** (attempt - 1) : 1) * 1_000
+				if (!step.internal)
+					await hooks?.onNodeError?.({
+						runId: id,
+						flowId: plan.id,
+						input,
+						ctx: context,
+						nodeId: step.id,
+						nodeInput,
+						nodeCtx: attemptContext,
+						attempt,
+						maxAttempts: retry.attempts,
+						error,
+						willRetry,
+					})
 				if (controller.signal.aborted) break
-				if (attempt < retry.attempts)
-					await sleep(
-						(retry.backoff === 'exponential' ? 2 ** (attempt - 1) : 1) * 1_000,
-						signal,
-					)
+				if (willRetry) {
+					if (!step.internal)
+						await hooks?.onNodeRetry?.({
+							runId: id,
+							flowId: plan.id,
+							input,
+							ctx: context,
+							nodeId: step.id,
+							nodeInput,
+							nodeCtx: attemptContext,
+							attempt,
+							maxAttempts: retry.attempts,
+							error,
+							willRetry,
+							delay,
+						})
+					await sleep(delay, signal)
+				}
 			}
 		}
 		nodes.set(step.id, {
@@ -272,6 +366,19 @@ export async function executePlan(
 			attempts: retry.attempts,
 			error: lastError instanceof Error ? lastError.message : String(lastError),
 		})
+		if (!step.internal)
+			await hooks?.onNodeFail?.({
+				runId: id,
+				flowId: plan.id,
+				input,
+				ctx: context,
+				nodeId: step.id,
+				nodeInput,
+				nodeCtx: nodeContext,
+				node: nodeRun(nodes, step.id),
+				error: lastError,
+			})
+		await finish()
 		throw lastError
 	}
 
@@ -382,6 +489,32 @@ export async function executePlan(
 					: String(error),
 		)
 		await update(result)
+		if (cancelled) {
+			for (const [nodeId, node] of nodes) {
+				if (node.status !== 'cancelled') continue
+				const step = byId.get(nodeId)
+				if (!step || step.internal) continue
+				const nodeContext = {
+					...context,
+					flowId: plan.id,
+					nodeId,
+					runId: id,
+					signal,
+				}
+				const event = {
+					runId: id,
+					flowId: plan.id,
+					input,
+					ctx: context,
+					nodeId,
+					nodeInput: resolve(step.input, outputs),
+					nodeCtx: nodeContext,
+					node,
+				}
+				await hooks?.onNodeCancel?.(event)
+				await hooks?.onNodeFinish?.(event)
+			}
+		} else await hooks?.onRunFail?.(result, error)
 		return result
 	}
 }

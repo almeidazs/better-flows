@@ -6,6 +6,7 @@ export const flowBrand = Symbol('better-flows.flow')
 export const referenceBrand = Symbol('better-flows.reference')
 
 export type {
+	EngineHooks,
 	MapStep,
 	Plan,
 	Reference,

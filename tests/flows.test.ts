@@ -1,6 +1,12 @@
 import { expect, test } from 'bun:test'
 
-import { betterFlows, defineNode, type NodeOutput, type Schema } from '../src'
+import {
+	betterFlows,
+	defineNode,
+	definePlugin,
+	type NodeOutput,
+	type Schema,
+} from '../src'
 import { memory } from '../src/runtimes/memory'
 
 function schema<T>(): Schema<unknown, T> {
@@ -234,6 +240,7 @@ test('limits map concurrency', async () => {
 
 test('retries transient node failures', async () => {
 	let attempts = 0
+	const events: string[] = []
 	const flaky = defineNode<undefined, string>({
 		id: 'flaky',
 		retry: { attempts: 2, backoff: 'fixed' },
@@ -243,7 +250,19 @@ test('retries transient node failures', async () => {
 			return 'ok'
 		},
 	})
-	const flows = betterFlows({ runtime: memory(), nodes: { flaky } })
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: { flaky },
+		hooks: {
+			onNodeStart: ({ attempt }) => events.push(`start:${attempt}`),
+			onNodeError: ({ attempt, willRetry }) =>
+				events.push(`error:${attempt}:${willRetry}`),
+			onNodeRetry: ({ attempt, delay }) =>
+				events.push(`retry:${attempt}:${delay}`),
+			onNodeComplete: ({ node }) => events.push(`complete:${node.attempts}`),
+			onNodeFinish: ({ node }) => events.push(`finish:${node.status}`),
+		},
+	})
 	const flow = flows.defineFlow<undefined, string>({
 		id: 'retry',
 		flow: ({ node }) => node(flaky, undefined),
@@ -251,9 +270,17 @@ test('retries transient node failures', async () => {
 	const result = await (await flow.run(undefined)).wait()
 	expect(result.status).toBe('completed')
 	expect(result.nodes.flaky?.attempts).toBe(2)
+	expect(events).toEqual([
+		'start:1',
+		'error:1:true',
+		'retry:1:1000',
+		'start:2',
+		'complete:2',
+		'finish:completed',
+	])
 })
 
-test('validates schemas, invokes plugin hooks, and exposes a running snapshot', async () => {
+test('invokes native and plugin hooks and exposes a running snapshot', async () => {
 	const events: string[] = []
 	const slow = defineNode<undefined, string>({
 		id: 'slow',
@@ -268,19 +295,27 @@ test('validates schemas, invokes plugin hooks, and exposes a running snapshot', 
 	const flows = betterFlows({
 		runtime: memory(),
 		nodes: { slow },
-		plugins: [
-			{
-				name: 'audit',
-				onRunStart: ({ id }) => {
-					events.push(`start:${id}`)
-				},
-				onNodeStart: ({ nodeId }) => {
-					events.push(`${nodeId}:start`)
-				},
-				onRunFinish: ({ status }) => {
-					events.push(`finish:${status}`)
-				},
+		hooks: {
+			onRunStart: ({ runId }) => {
+				events.push(`start:${runId}`)
 			},
+			onNodeStart: ({ nodeId }) => {
+				events.push(`${nodeId}:start`)
+			},
+			onRunFinish: ({ run }) => {
+				events.push(`finish:${run.status}`)
+			},
+		},
+		plugins: [
+			definePlugin({
+				name: 'audit',
+				context: () => ({ source: 'plugin' as const }),
+				hooks: {
+					onNodeComplete: ({ nodeId, nodeCtx }) => {
+						events.push(`${nodeId}:complete:${nodeCtx.audit.source}`)
+					},
+				},
+			}),
 		] as const,
 	})
 	const flow = flows.defineFlow<undefined, string>({
@@ -291,11 +326,13 @@ test('validates schemas, invokes plugin hooks, and exposes a running snapshot', 
 	expect((await flows.runs.get(run.id))?.status).toBe('running')
 	expect((await run.wait()).output).toBe('done')
 	expect(events.some((event) => event === 'slow:start')).toBe(true)
+	expect(events.some((event) => event === 'slow:complete:plugin')).toBe(true)
 	expect(events.some((event) => event === 'finish:completed')).toBe(true)
 })
 
 test('fails a timed out node and does not run dependants', async () => {
 	let dependantRan = false
+	const events: string[] = []
 	const slow = defineNode<undefined, string>({
 		id: 'slow',
 		timeout: '1ms',
@@ -309,7 +346,21 @@ test('fails a timed out node and does not run dependants', async () => {
 			return 'unexpected'
 		},
 	})
-	const flows = betterFlows({ runtime: memory(), nodes: { slow, dependant } })
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: { slow, dependant },
+		hooks: {
+			onNodeError: ({ error, willRetry }) =>
+				events.push(
+					`error:${error instanceof Error ? error.message : error}:${willRetry}`,
+				),
+			onNodeFail: ({ nodeId }) => events.push(`fail:${nodeId}`),
+			onNodeFinish: ({ node }) => events.push(`finish:${node.status}`),
+			onRunFail: ({ error }) =>
+				events.push(`run:${error instanceof Error ? error.message : error}`),
+			onRunFinish: ({ run }) => events.push(`run-finish:${run.status}`),
+		},
+	})
 	const flow = flows.defineFlow<undefined, string>({
 		id: 'timeout',
 		flow: ({ node }) => node(dependant, node(slow, undefined)),
@@ -318,6 +369,13 @@ test('fails a timed out node and does not run dependants', async () => {
 	expect(result.status).toBe('failed')
 	expect(result.nodes.slow?.status).toBe('failed')
 	expect(dependantRan).toBe(false)
+	expect(events).toEqual([
+		'error:Node "slow" timed out.:false',
+		'fail:slow',
+		'finish:failed',
+		'run:Node "slow" timed out.',
+		'run-finish:failed',
+	])
 })
 
 test('rejects branch values that are not workflow references', () => {
@@ -419,6 +477,7 @@ test('starts dependants as soon as their own dependency completes', async () => 
 })
 
 test('cancels a cooperative running node', async () => {
+	const events: string[] = []
 	const waiting = defineNode<undefined, string>({
 		id: 'waiting',
 		run: ({ ctx }) =>
@@ -428,7 +487,16 @@ test('cancels a cooperative running node', async () => {
 				),
 			),
 	})
-	const flows = betterFlows({ runtime: memory(), nodes: { waiting } })
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: { waiting },
+		hooks: {
+			onNodeCancel: ({ nodeId }) => events.push(`node:${nodeId}`),
+			onNodeFinish: ({ node }) => events.push(`finish:${node.status}`),
+			onRunCancel: () => events.push('run'),
+			onRunFinish: ({ run }) => events.push(`run-finish:${run.status}`),
+		},
+	})
 	const flow = flows.defineFlow<undefined, string>({
 		id: 'cancel',
 		flow: ({ node }) => node(waiting, undefined),
@@ -438,6 +506,54 @@ test('cancels a cooperative running node', async () => {
 	const result = await run.wait()
 	expect(result.status).toBe('cancelled')
 	expect(result.nodes.waiting?.status).toBe('cancelled')
+	expect(events).toEqual([
+		'node:waiting',
+		'finish:cancelled',
+		'run',
+		'run-finish:cancelled',
+	])
+})
+
+test('reports skipped nodes and hook errors without changing the run outcome', async () => {
+	const events: string[] = []
+	const source = defineNode<undefined, boolean>({
+		id: 'source',
+		run: () => false,
+	})
+	const skipped = defineNode<undefined, undefined>({
+		id: 'skipped',
+		run: () => undefined,
+	})
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: { source, skipped },
+		hooks: {
+			onNodeComplete: () => {
+				throw new Error('metrics unavailable')
+			},
+			onNodeSkip: ({ nodeId }) => events.push(`skip:${nodeId}`),
+			onNodeFinish: ({ node }) => events.push(`finish:${node.status}`),
+			onHookError: ({ hook, error }) =>
+				events.push(
+					`${hook}:${error instanceof Error ? error.message : error}`,
+				),
+		},
+	})
+	const flow = flows.defineFlow<undefined, undefined>({
+		id: 'hook-errors',
+		flow: ({ node, when }) => {
+			when(node(source, undefined), () => node(skipped, undefined))
+			return undefined
+		},
+	})
+	const result = await (await flow.run(undefined)).wait()
+	expect(result.status).toBe('completed')
+	expect(events).toEqual([
+		'onNodeComplete:metrics unavailable',
+		'finish:completed',
+		'skip:skipped',
+		'finish:skipped',
+	])
 })
 
 test('settles invalid flow input as a failed run and calls finish hooks', async () => {
@@ -453,14 +569,11 @@ test('settles invalid flow input as a failed run and calls finish hooks', async 
 	const flows = betterFlows({
 		runtime: memory(),
 		nodes: {},
-		plugins: [
-			{
-				name: 'finish',
-				onRunFinish: ({ status }) => {
-					events.push(status)
-				},
+		hooks: {
+			onRunFinish: ({ run }) => {
+				events.push(run.status)
 			},
-		],
+		},
 	})
 	const flow = flows.defineFlow<undefined, undefined>({
 		id: 'invalid-input',
@@ -471,4 +584,29 @@ test('settles invalid flow input as a failed run and calls finish hooks', async 
 	expect(result.status).toBe('failed')
 	expect(result.error).toContain('leadId is required')
 	expect(events).toEqual(['failed'])
+})
+
+test('settles context initialization failures and reports their original error', async () => {
+	const events: string[] = []
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: {},
+		context: () => {
+			throw new Error('database unavailable')
+		},
+		hooks: {
+			onRunStart: () => events.push('start'),
+			onRunFail: ({ error }) =>
+				events.push(error instanceof Error ? error.message : String(error)),
+			onRunFinish: ({ run }) => events.push(`finish:${run.status}`),
+		},
+	})
+	const flow = flows.defineFlow<undefined, undefined>({
+		id: 'context-failure',
+		flow: () => undefined,
+	})
+	const result = await (await flow.run(undefined)).wait()
+	expect(result.status).toBe('failed')
+	expect(result.error).toBe('database unavailable')
+	expect(events).toEqual(['database unavailable', 'finish:failed'])
 })

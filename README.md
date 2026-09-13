@@ -19,7 +19,7 @@ Queues move jobs; Better Flows models the work itself.
 - Dependencies are inferred, so independent work runs concurrently.
 - Retries, timeouts, cancellation, branches, and run snapshots are built in.
 - Runtimes are replaceable: use memory in tests and BullMQ in production.
-- Plugins keep observability and infrastructure out of business logic.
+- Native hooks keep observability and infrastructure out of business logic.
 
 ## A real workflow
 
@@ -119,7 +119,21 @@ output. Without `concurrency`, every ready item runs in parallel.
 - [Memory](src/runtimes/memory/README.md) — fast, process-local execution for tests and development.
 - [BullMQ](src/runtimes/bullmq/README.md) — Redis-backed producer and worker execution.
 
-## Plugins
+## Lifecycle hooks
 
-Use plugins for tracing, metrics, audit logs, and shared services. They receive
-run and node lifecycle hooks, while nodes remain focused on business work.
+Observe every run without coupling workflow code to an observability provider.
+
+```ts
+const flows = betterFlows({
+	runtime: memory(),
+	nodes: { enrichLead },
+	hooks: {
+		onNodeError: ({ nodeId, error, willRetry }) => {
+				logger.error({ nodeId, error, willRetry }, 'Node failed')
+			},
+		onRunFinish: ({ run }) => metrics.record(run),
+	},
+})
+```
+
+Plugins can contribute these same hooks, plus shared context and public APIs.

@@ -4,32 +4,63 @@ import {
 	type FlowDefinition,
 	type RunHandle,
 } from './flows'
-import type { AnyNode, NodeContext } from './nodes'
-import type { Plugin, PluginApi } from './plugins'
+import type { AnyNode } from './nodes'
+import type { PluginApi, PluginDefinition } from './plugins'
 import type { RunSnapshot, Runtime, WorkerRuntime } from './runtimes'
 import { executePlan } from './runtimes/engine'
+import type { HookName, HookResult, Hooks } from './types'
+import type { EngineHooks } from './types/internal'
+
+function createHookDispatcher(hooks: readonly Hooks[]) {
+	const report = async (hook: HookName, event: unknown, error: unknown) => {
+		for (const configured of hooks) {
+			try {
+				await configured.onHookError?.({ hook, event, error })
+			} catch {}
+		}
+	}
+	return {
+		async dispatch(hook: HookName, event: unknown) {
+			for (const configured of hooks) {
+				const callback = configured[hook] as
+					| ((value: unknown) => HookResult)
+					| undefined
+				if (!callback) continue
+				try {
+					await callback(event)
+				} catch (error) {
+					await report(hook, event, error)
+				}
+			}
+		},
+	}
+}
 
 /** Configuration used to create a Better Flows instance. */
 export interface BetterFlowsOptions<
 	TNodes extends Record<string, AnyNode>,
 	TContext extends object,
-	TPlugins extends readonly Plugin[],
+	TPlugins extends readonly PluginDefinition[],
 > {
 	readonly runtime: Runtime
+	/** Registry of nodes available to flows defined on this instance. */
 	readonly nodes: TNodes
+	/** Native lifecycle callbacks for every workflow execution. */
+	readonly hooks?: Hooks<TContext>
 	/** Produces application context for each execution. */
 	readonly context?: (arguments_: {
 		readonly flowId: string
 		readonly input: unknown
 		readonly runId: string
 	}) => TContext | Promise<TContext>
+	/** Optional extensions that provide context, hooks, or a public API. */
 	readonly plugins?: TPlugins
 }
 
 /** Runtime-bound API for defining, running, and inspecting workflows. */
 export interface BetterFlows<
 	TNodes extends Record<string, AnyNode>,
-	TPlugins extends readonly Plugin[],
+	TPlugins extends readonly PluginDefinition[],
 > {
 	/** Compiles and registers a named workflow on this instance. */
 	defineFlow<TInput, TOutput>(
@@ -46,7 +77,9 @@ export interface BetterFlows<
 			id: string,
 		): Promise<RunSnapshot | undefined>
 	}
+	/** Registered nodes. */
 	readonly nodes: TNodes
+	/** APIs exposed by configured plugins, keyed by plugin name. */
 	readonly plugins: PluginApi<TPlugins>
 	/** Starts a worker when the configured runtime supports workers. */
 	worker(): { close(): Promise<void> }
@@ -59,11 +92,18 @@ export interface BetterFlows<
 export function betterFlows<
 	TNodes extends Record<string, AnyNode>,
 	TContext extends object = object,
-	const TPlugins extends readonly Plugin[] = readonly Plugin[],
+	const TPlugins extends
+		readonly PluginDefinition[] = readonly PluginDefinition[],
 >(
 	options: BetterFlowsOptions<TNodes, TContext, TPlugins>,
 ): BetterFlows<TNodes, TPlugins> {
 	const plugins = options.plugins ?? ([] as unknown as TPlugins)
+	const hookDispatcher = createHookDispatcher([
+		...(options.hooks ? [options.hooks as Hooks] : []),
+		...plugins.flatMap((plugin) =>
+			plugin.hooks ? [plugin.hooks as Hooks] : [],
+		),
+	])
 
 	const names = new Set<string>()
 
@@ -94,24 +134,72 @@ export function betterFlows<
 				update: (snapshot: RunSnapshot) => Promise<void> | void,
 				signal: AbortSignal,
 			) => {
-				const context = {
-					...(options.context
-						? await options.context({ flowId: flow.id, input, runId: id })
-						: {}),
-					...Object.fromEntries(
-						await Promise.all(
-							plugins.map(
-								async (plugin) =>
-									[
-										plugin.name,
-										plugin.context ? await plugin.context({}) : {},
-									] as const,
+				let context: Record<string, unknown>
+				try {
+					context = {
+						...(options.context
+							? await options.context({ flowId: flow.id, input, runId: id })
+							: {}),
+						...Object.fromEntries(
+							await Promise.all(
+								plugins.map(
+									async (plugin) =>
+										[
+											plugin.name,
+											plugin.context ? await plugin.context({}) : {},
+										] as const,
+								),
 							),
 						),
-					),
+					}
+				} catch (error) {
+					context = {}
+					const result: RunSnapshot = {
+						id,
+						status: 'failed',
+						error: error instanceof Error ? error.message : String(error),
+						nodes: Object.fromEntries(
+							flow.plan.steps.map((step) => [
+								step.id,
+								{ status: 'pending', attempts: 0 },
+							]),
+						),
+					}
+					await update(result)
+					const event = {
+						runId: id,
+						flowId: flow.id,
+						input,
+						ctx: context,
+						run: result,
+					}
+					await hookDispatcher.dispatch('onRunFail', { ...event, error })
+					await hookDispatcher.dispatch('onRunFinish', event)
+					return result
 				}
-				for (const plugin of plugins)
-					await plugin.onRunStart?.({ id, flowId: flow.id })
+				await hookDispatcher.dispatch('onRunStart', {
+					runId: id,
+					flowId: flow.id,
+					input,
+					ctx: context,
+				})
+				let runError: unknown
+				const nodeHooks: EngineHooks = {
+					onNodeStart: (event) => hookDispatcher.dispatch('onNodeStart', event),
+					onNodeComplete: (event) =>
+						hookDispatcher.dispatch('onNodeComplete', event),
+					onNodeError: (event) => hookDispatcher.dispatch('onNodeError', event),
+					onNodeRetry: (event) => hookDispatcher.dispatch('onNodeRetry', event),
+					onNodeFail: (event) => hookDispatcher.dispatch('onNodeFail', event),
+					onNodeSkip: (event) => hookDispatcher.dispatch('onNodeSkip', event),
+					onNodeCancel: (event) =>
+						hookDispatcher.dispatch('onNodeCancel', event),
+					onNodeFinish: (event) =>
+						hookDispatcher.dispatch('onNodeFinish', event),
+					onRunFail: (_, error) => {
+						runError = error
+					},
+				}
 				const result = await executePlan(
 					id,
 					flow.plan,
@@ -119,12 +207,25 @@ export function betterFlows<
 					context,
 					update,
 					signal,
-					async (node) => {
-						for (const plugin of plugins)
-							await plugin.onNodeStart?.(node as NodeContext)
-					},
+					nodeHooks,
 				)
-				for (const plugin of plugins) await plugin.onRunFinish?.(result)
+				const event = {
+					runId: id,
+					flowId: flow.id,
+					input,
+					ctx: context,
+					run: result,
+				}
+				if (result.status === 'completed')
+					await hookDispatcher.dispatch('onRunComplete', event)
+				else if (result.status === 'cancelled')
+					await hookDispatcher.dispatch('onRunCancel', event)
+				else
+					await hookDispatcher.dispatch('onRunFail', {
+						...event,
+						error: runError ?? new Error(result.error),
+					})
+				await hookDispatcher.dispatch('onRunFinish', event)
 				return result
 			},
 		}

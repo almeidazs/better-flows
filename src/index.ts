@@ -8,7 +8,12 @@ export type {
 	NodeOutput,
 } from './nodes'
 export { defineNode } from './nodes'
-export type { Plugin } from './plugins'
+export type {
+	Plugin,
+	PluginApi,
+	PluginDefinition,
+	PluginHookContext,
+} from './plugins'
 export { definePlugin } from './plugins'
 export type {
 	NodeRun,
@@ -18,5 +23,29 @@ export type {
 	Runtime,
 	WorkerRuntime,
 } from './runtimes'
-export type { InferSchemaInput, InferSchemaOutput, Schema } from './types'
+export type {
+	HookErrorEvent,
+	HookName,
+	HookResult,
+	Hooks,
+	InferSchemaInput,
+	InferSchemaOutput,
+	NodeAttemptEvent,
+	NodeCancelEvent,
+	NodeCompleteEvent,
+	NodeErrorEvent,
+	NodeFailEvent,
+	NodeFinishEvent,
+	NodeHookEvent,
+	NodeRetryEvent,
+	NodeSkipEvent,
+	NodeStartEvent,
+	RunCancelEvent,
+	RunCompleteEvent,
+	RunFailEvent,
+	RunFinishEvent,
+	RunHookEvent,
+	RunStartEvent,
+	Schema,
+} from './types'
 export { version } from './version'
