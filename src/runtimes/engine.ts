@@ -75,6 +75,103 @@ function remapMapValue(
 	)
 }
 
+function loopValue(
+	value: unknown,
+	state: unknown,
+	iteration: number,
+	ids: ReadonlyMap<string, string>,
+	preserved = new Set<string>(),
+): unknown {
+	const reference = getReference(value)
+	if (reference) {
+		const { nodeId, path } = reference[referenceBrand]
+		if (nodeId === '$loop:state')
+			return path.reduce<unknown>(
+				(current, property) =>
+					current === null || current === undefined
+						? undefined
+						: (current as Record<PropertyKey, unknown>)[property],
+				state,
+			)
+		if (nodeId === '$loop:iteration') return iteration
+		if (preserved.has(nodeId)) return value
+		const id = ids.get(nodeId)
+		return id ? createReference(id, path) : value
+	}
+	if (Array.isArray(value))
+		return value.map((entry) =>
+			loopValue(entry, state, iteration, ids, preserved),
+		)
+	if (
+		typeof value !== 'object' ||
+		value === null ||
+		(Object.getPrototypeOf(value) !== Object.prototype &&
+			Object.getPrototypeOf(value) !== null)
+	)
+		return value
+	return Object.fromEntries(
+		Object.entries(value).map(([key, entry]) => [
+			key,
+			loopValue(entry, state, iteration, ids, preserved),
+		]),
+	)
+}
+
+function expandLoop(
+	loop: Plan['loops'][number],
+	state: unknown,
+	iteration: number,
+): { steps: Step[]; maps: Plan['maps']; result: unknown; prefix: string } {
+	const prefix = `${loop.id}[${iteration}]`
+	const ids = new Map<string, string>([
+		...loop.steps.map((step) => [step.id, `${prefix}.${step.id}`] as const),
+		...loop.maps.map((map) => [map.id, `${prefix}.${map.id}`] as const),
+	])
+	const steps = loop.steps.map((step) => {
+		const id = ids.get(step.id)
+		if (!id) throw new Error(`Loop "${loop.id}" generated an invalid step ID.`)
+		return {
+			...step,
+			id,
+			input: loopValue(step.input, state, iteration, ids),
+			conditions: step.conditions.map((condition) => ({
+				...condition,
+				value: loopValue(condition.value, state, iteration, ids) as Reference,
+			})),
+		}
+	})
+	const maps = loop.maps.map((map) => {
+		const localIds = new Set(map.steps.map((step) => step.id))
+		const id = ids.get(map.id)
+		if (!id) throw new Error(`Loop "${loop.id}" generated an invalid map ID.`)
+		return {
+			...map,
+			id,
+			items: loopValue(map.items, state, iteration, ids),
+			steps: map.steps.map((step) => ({
+				...step,
+				input: loopValue(step.input, state, iteration, ids, localIds),
+				conditions: step.conditions.map((condition) => ({
+					...condition,
+					value: loopValue(
+						condition.value,
+						state,
+						iteration,
+						ids,
+						localIds,
+					) as Reference,
+				})),
+			})),
+		}
+	})
+	return {
+		steps,
+		maps,
+		result: loopValue(loop.result, state, iteration, ids),
+		prefix,
+	}
+}
+
 function expandMap(
 	map: Plan['maps'][number],
 	items: readonly unknown[],
@@ -124,7 +221,7 @@ function expandMap(
 }
 
 function isSelected(
-	step: Step,
+	step: Pick<Step, 'conditions'>,
 	outputs: ReadonlyMap<string, unknown>,
 ): boolean {
 	return step.conditions.every(
@@ -206,13 +303,27 @@ export async function executePlan(
 	signal: AbortSignal,
 	hooks?: EngineHooks,
 ): Promise<RunSnapshot> {
-	const nodes = new Map<string, NodeRun>(
-		plan.steps.map((step) => [step.id, { status: 'pending', attempts: 0 }]),
-	)
+	const nodes = new Map<string, NodeRun>([
+		...plan.steps.map(
+			(step) => [step.id, { status: 'pending', attempts: 0 }] as const,
+		),
+		...plan.loops.map(
+			(loop) => [loop.id, { status: 'pending', attempts: 0 }] as const,
+		),
+	])
 	const outputs = new Map<string, unknown>()
 	const remaining = new Set(plan.steps.map((step) => step.id))
 	const byId = new Map(plan.steps.map((step) => [step.id, step]))
 	const remainingMaps = new Map(plan.maps.map((map) => [map.id, map]))
+	const remainingLoops = new Map(plan.loops.map((loop) => [loop.id, loop]))
+	const activeLoops = new Map<
+		string,
+		{
+			readonly iteration: number
+			readonly prefix: string
+			readonly result: unknown
+		}
+	>()
 	const active = new Map<Promise<void>, Step>()
 	const activeMaps = new Map<string, number>()
 	const publish = async (status: RunSnapshot['status'] = 'running') =>
@@ -382,19 +493,98 @@ export async function executePlan(
 		throw lastError
 	}
 
+	const dependenciesComplete = (value: unknown) =>
+		[...dependencies(value)].every(
+			(dependency) =>
+				dependency === '$input' ||
+				nodes.get(dependency)?.status === 'completed',
+		)
+	const scheduleLoop = (
+		loop: Plan['loops'][number],
+		state: unknown,
+		iteration: number,
+	) => {
+		nodes.set(loop.id, { status: 'running', attempts: iteration })
+		if (!loop.while(state)) {
+			outputs.set(loop.id, state)
+			nodes.set(loop.id, {
+				status: 'completed',
+				attempts: iteration,
+				output: state,
+			})
+			return
+		}
+		if (iteration >= loop.maxIterations) {
+			const error = `Loop "${loop.id}" exceeded its maximum of ${loop.maxIterations} iterations.`
+			nodes.set(loop.id, { status: 'failed', attempts: iteration, error })
+			throw new Error(error)
+		}
+		const expanded = expandLoop(loop, state, iteration)
+		for (const step of expanded.steps) {
+			if (byId.has(step.id))
+				throw new Error(`Loop "${loop.id}" generated a duplicate step ID.`)
+			byId.set(step.id, step)
+			remaining.add(step.id)
+			nodes.set(step.id, { status: 'pending', attempts: 0 })
+		}
+		for (const map of expanded.maps) {
+			if (remainingMaps.has(map.id))
+				throw new Error(`Loop "${loop.id}" generated a duplicate map ID.`)
+			remainingMaps.set(map.id, map)
+		}
+		activeLoops.set(loop.id, {
+			iteration,
+			prefix: expanded.prefix,
+			result: expanded.result,
+		})
+	}
+
 	try {
 		outputs.set('$input', await validate(plan.input, input))
-		while (remaining.size > 0 || remainingMaps.size > 0 || active.size > 0) {
+		while (
+			remaining.size > 0 ||
+			remainingMaps.size > 0 ||
+			remainingLoops.size > 0 ||
+			activeLoops.size > 0 ||
+			active.size > 0
+		) {
 			if (signal.aborted) throw new DOMException('Run cancelled', 'AbortError')
-			for (const [mapId, map] of remainingMaps) {
+			for (const [loopId, loop] of remainingLoops) {
 				if (
-					![...dependencies(map.items)].every(
-						(dependency) =>
-							dependency === '$input' ||
-							nodes.get(dependency)?.status === 'completed',
+					!dependenciesComplete(loop.initial) ||
+					!loop.conditions.every((condition) =>
+						dependenciesComplete(condition.value),
 					)
 				)
 					continue
+				remainingLoops.delete(loopId)
+				if (!isSelected({ conditions: loop.conditions }, outputs)) {
+					nodes.set(loop.id, { status: 'skipped', attempts: 0 })
+					continue
+				}
+				scheduleLoop(loop, resolve(loop.initial, outputs), 0)
+			}
+			for (const [loopId, activeLoop] of activeLoops) {
+				const busy =
+					[...remaining].some((id) => id.startsWith(`${activeLoop.prefix}.`)) ||
+					[...active.values()].some((step) =>
+						step.id.startsWith(`${activeLoop.prefix}.`),
+					) ||
+					[...remainingMaps.keys()].some((id) =>
+						id.startsWith(`${activeLoop.prefix}.`),
+					)
+				if (busy) continue
+				const loop = plan.loops.find((candidate) => candidate.id === loopId)
+				if (!loop) throw new Error(`Loop "${loopId}" was not found.`)
+				activeLoops.delete(loopId)
+				scheduleLoop(
+					loop,
+					resolve(activeLoop.result, outputs),
+					activeLoop.iteration + 1,
+				)
+			}
+			for (const [mapId, map] of remainingMaps) {
+				if (!dependenciesComplete(map.items)) continue
 				const items = resolve(map.items, outputs)
 				if (!Array.isArray(items))
 					throw new TypeError(`map "${mapId}" source must resolve to an array.`)
@@ -407,22 +597,23 @@ export async function executePlan(
 					nodes.set(step.id, { status: 'pending', attempts: 0 })
 				}
 			}
+			if (
+				remaining.size === 0 &&
+				remainingMaps.size === 0 &&
+				remainingLoops.size === 0 &&
+				activeLoops.size === 0 &&
+				active.size === 0
+			)
+				break
 			const ready = [...remaining]
 				.map((stepId) => byId.get(stepId))
 				.filter((step): step is Step => Boolean(step))
-				.filter((step) =>
-					[
-						...new Set([
-							...dependencies(step.input),
-							...step.conditions.flatMap((condition) => [
-								...dependencies(condition.value),
-							]),
-						]),
-					].every(
-						(dependency) =>
-							dependency === '$input' ||
-							nodes.get(dependency)?.status === 'completed',
-					),
+				.filter(
+					(step) =>
+						dependenciesComplete(step.input) &&
+						step.conditions.every((condition) =>
+							dependenciesComplete(condition.value),
+						),
 				)
 			const mapSlots = new Map(activeMaps)
 			const limitedReady = ready.filter((step) => {
@@ -471,6 +662,16 @@ export async function executePlan(
 		const cancelled =
 			signal.aborted ||
 			(error instanceof DOMException && error.name === 'AbortError')
+		if (!cancelled)
+			for (const [loopId, activeLoop] of activeLoops) {
+				const node = nodeRun(nodes, loopId)
+				if (node.status !== 'running') continue
+				nodes.set(loopId, {
+					status: 'failed',
+					attempts: activeLoop.iteration + 1,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
 		for (const [nodeId, node] of nodes)
 			if (node.status === 'pending' || node.status === 'running')
 				nodes.set(nodeId, {

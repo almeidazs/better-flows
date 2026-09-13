@@ -7,6 +7,7 @@ export const referenceBrand = Symbol('better-flows.reference')
 
 export type {
 	EngineHooks,
+	LoopStep,
 	MapStep,
 	Plan,
 	Reference,

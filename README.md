@@ -123,6 +123,28 @@ return node(generateReport, { companies: enriched })
 The callback may define a small per-item flow and must return its final node
 output. Without `concurrency`, every ready item runs in parallel.
 
+## Explicit loops
+
+Flows are DAGs by default. Use `loop()` when state must move through explicit,
+sequential iterations; each iteration still runs its independent nodes in
+parallel. A loop fails after 100 iterations by default, or at `maxIterations`.
+
+```ts
+const polling = flows.defineFlow({
+	id: 'wait-for-export',
+	flow: ({ loop }) =>
+		loop({
+			initial: { attempts: 0, ready: false },
+			while: (state) => !state.ready,
+			maxIterations: 12,
+			run: ({ state, node }) => node(checkExport, state),
+		}),
+})
+```
+
+The returned node output becomes the next state. `state` and `iteration` are
+fully typed inside `run()`, and `map()` is supported within an iteration.
+
 ## Runtimes
 
 - [Memory](src/runtimes/memory/README.md) — fast, process-local execution for tests and development.

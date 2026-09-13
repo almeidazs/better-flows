@@ -92,11 +92,23 @@ export interface MapStep {
 	readonly result: unknown
 	readonly concurrency?: number
 }
+export interface LoopStep {
+	readonly id: string
+	readonly initial: unknown
+	readonly while: (state: unknown) => boolean
+	readonly conditions: Step['conditions']
+	readonly steps: readonly Step[]
+	readonly maps: readonly MapStep[]
+	readonly result: unknown
+	readonly maxIterations: number
+}
+
 export interface Plan {
 	readonly id: string
 	readonly input?: Schema
 	readonly output?: Schema
 	readonly steps: readonly Step[]
 	readonly maps: readonly MapStep[]
+	readonly loops: readonly LoopStep[]
 	readonly result: unknown
 }

@@ -238,6 +238,152 @@ test('limits map concurrency', async () => {
 	expect(maximum).toBe(2)
 })
 
+test('executes typed loop state transitions until the condition is false', async () => {
+	const advance = defineNode<
+		{ readonly attempts: number },
+		{ readonly attempts: number }
+	>({
+		id: 'advance',
+		run: ({ input }) => ({ attempts: input.attempts + 1 }),
+	})
+	const flows = betterFlows({ runtime: memory(), nodes: { advance } })
+	const flow = flows.defineFlow<undefined, { readonly attempts: number }>({
+		id: 'loop-state',
+		flow: ({ loop }) =>
+			loop({
+				initial: { attempts: 0 },
+				while: (state) => state.attempts < 3,
+				run: ({ state, node }) => node(advance, state),
+			}),
+	})
+	const result = await (await flow.run(undefined)).wait()
+	expect(result.status).toBe('completed')
+	expect(result.output).toEqual({ attempts: 3 })
+	expect(result.nodes['loop-1[0].advance']?.status).toBe('completed')
+	expect(result.nodes['loop-1[2].advance']?.output).toEqual({ attempts: 3 })
+})
+
+test('supports map inside a loop iteration', async () => {
+	const source = defineNode<
+		{ readonly values: readonly number[] },
+		readonly number[]
+	>({
+		id: 'source',
+		run: ({ input }) => input.values,
+	})
+	const double = defineNode<number, number>({
+		id: 'double',
+		run: ({ input }) => input * 2,
+	})
+	const next = defineNode<
+		{ readonly attempts: number; readonly values: readonly number[] },
+		{ readonly attempts: number; readonly values: readonly number[] }
+	>({
+		id: 'next',
+		run: ({ input }) => ({ ...input, attempts: input.attempts + 1 }),
+	})
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: { source, double, next },
+	})
+	const flow = flows.defineFlow<
+		undefined,
+		{ readonly attempts: number; readonly values: readonly number[] }
+	>({
+		id: 'loop-map',
+		flow: ({ loop }) =>
+			loop({
+				initial: { attempts: 0, values: [1, 2] as readonly number[] },
+				while: (state) => state.attempts < 1,
+				run: ({ state, node, map }) => {
+					const values = node(source, { values: state.values })
+					const doubled = map(values, (value) => node(double, value))
+					return node(next, { attempts: state.attempts, values: doubled })
+				},
+			}),
+	})
+	const result = await (await flow.run(undefined)).wait()
+	expect(result.status).toBe('completed')
+	expect(result.output).toEqual({ attempts: 1, values: [2, 4] })
+})
+
+test('fails loops that exceed their maximum and rejects nested loops', async () => {
+	const same = defineNode<number, number>({
+		id: 'same',
+		run: ({ input }) => input,
+	})
+	const flows = betterFlows({ runtime: memory(), nodes: { same } })
+	const limited = flows.defineFlow<undefined, number>({
+		id: 'limited-loop',
+		flow: ({ loop }) =>
+			loop({
+				initial: 0,
+				while: () => true,
+				maxIterations: 2,
+				run: ({ state, node }) => node(same, state),
+			}),
+	})
+	const result = await (await limited.run(undefined)).wait()
+	expect(result.status).toBe('failed')
+	expect(result.error).toContain('exceeded its maximum of 2')
+	expect(result.nodes['loop-1']?.status).toBe('failed')
+	expect(result.nodes['loop-1']?.attempts).toBe(2)
+	expect(() =>
+		flows.defineFlow<undefined, number>({
+			id: 'nested-loop',
+			flow: ({ loop }) =>
+				loop({
+					initial: 0,
+					while: () => false,
+					run: () =>
+						loop({
+							initial: 0,
+							while: () => false,
+							run: ({ state, node }) => node(same, state),
+						}),
+				}),
+		}),
+	).toThrow('cannot be nested')
+	expect(() =>
+		flows.defineFlow<number[], number[]>({
+			id: 'loop-in-map',
+			flow: ({ input, loop, map }) =>
+				map(input, () =>
+					loop({
+						initial: 0,
+						while: () => false,
+						run: ({ state, node }) => node(same, state),
+					}),
+				),
+		}),
+	).toThrow('loop() cannot be declared inside map()')
+})
+
+test('respects conditional paths around loops', async () => {
+	const increment = defineNode<number, number>({
+		id: 'increment',
+		run: ({ input }) => input + 1,
+	})
+	const flows = betterFlows({ runtime: memory(), nodes: { increment } })
+	const flow = flows.defineFlow<{ readonly enabled: boolean }, number>({
+		id: 'conditional-loop',
+		flow: ({ input, loop, when }) => {
+			let result = 0 as number
+			when(input.enabled, () => {
+				result = loop({
+					initial: 0,
+					while: (state) => state < 1,
+					run: ({ state, node }) => node(increment, state),
+				})
+			})
+			return result
+		},
+	})
+	const result = await (await flow.run({ enabled: false })).wait()
+	expect(result.status).toBe('completed')
+	expect(result.nodes['loop-1']?.status).toBe('skipped')
+})
+
 test('retries transient node failures', async () => {
 	let attempts = 0
 	const events: string[] = []

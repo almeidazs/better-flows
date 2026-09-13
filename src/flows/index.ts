@@ -1,5 +1,6 @@
 import {
 	createReference,
+	dependencies,
 	flowBrand,
 	getReference,
 	type Plan,
@@ -53,6 +54,22 @@ export interface FlowBuilder {
 		callback: (item: TItem, index: number) => TResult,
 		options?: { readonly concurrency?: number },
 	): TResult[]
+	/** Repeats a typed state transition until its runtime condition becomes false. */
+	loop<TState>(options: {
+		/** State used before the first iteration. */
+		readonly initial: TState
+		/** Determines whether another iteration should execute. */
+		readonly while: (state: TState) => boolean
+		/** Maximum iterations allowed before the run fails. Defaults to 100. */
+		readonly maxIterations?: number
+		/** Declares one iteration and returns the next state from a node output. */
+		readonly run: (
+			builder: FlowBuilder & {
+				readonly state: TState
+				readonly iteration: number
+			},
+		) => TState
+	}): TState
 }
 
 /** Declarative definition of a typed workflow. */
@@ -97,8 +114,26 @@ export function compileFlow<TInput, TOutput>(
 		result: unknown
 		concurrency?: number
 	}[] = []
+	const loops: {
+		id: string
+		initial: unknown
+		while: (state: unknown) => boolean
+		conditions: Step['conditions']
+		steps: readonly Step[]
+		maps: readonly {
+			id: string
+			items: unknown
+			steps: readonly Step[]
+			result: unknown
+			concurrency?: number
+		}[]
+		result: unknown
+		maxIterations: number
+	}[] = []
 	let activeSteps = steps
+	let activeMaps = maps
 	let mapDepth = 0
+	let loopDepth = 0
 	type Condition = {
 		value: Reference
 		expected: unknown
@@ -247,8 +282,8 @@ export function compileFlow<TInput, TOutput>(
 				throw new TypeError(
 					'map() callback must return a node output reference.',
 				)
-			const id = `map-${maps.length + 1}`
-			maps.push({
+			const id = `map-${activeMaps.length + 1}`
+			activeMaps.push({
 				id,
 				items,
 				steps: template,
@@ -259,14 +294,234 @@ export function compileFlow<TInput, TOutput>(
 			})
 			return createReference(id) as never
 		},
+		loop(options) {
+			if (mapDepth > 0)
+				throw new TypeError('loop() cannot be declared inside map().')
+			if (loopDepth > 0)
+				throw new TypeError('loop() cannot be nested inside another loop().')
+			const maxIterations = options.maxIterations ?? 100
+			if (!Number.isSafeInteger(maxIterations) || maxIterations < 1)
+				throw new TypeError('loop().maxIterations must be a positive integer.')
+			const template: Step[] = []
+			const loopMaps: typeof maps = []
+			const parentSteps = activeSteps
+			const parentMaps = activeMaps
+			activeSteps = template
+			activeMaps = loopMaps
+			loopDepth++
+			let result: unknown
+			try {
+				result = options.run({
+					...builder,
+					state: createReference('$loop:state') as never,
+					iteration: createReference('$loop:iteration') as never,
+				})
+			} finally {
+				loopDepth--
+				activeSteps = parentSteps
+				activeMaps = parentMaps
+			}
+			if (!getReference(result))
+				throw new TypeError('loop().run() must return a node output reference.')
+			const [resultNodeId] = dependencies(result)
+			if (
+				!resultNodeId ||
+				(!template.some((step) => step.id === resultNodeId) &&
+					!loopMaps.some((map) => map.id === resultNodeId))
+			)
+				throw new TypeError(
+					'loop().run() must return an output declared inside the loop.',
+				)
+			const id = `loop-${loops.length + 1}`
+			loops.push({
+				id,
+				initial: options.initial,
+				while: options.while as (state: unknown) => boolean,
+				conditions,
+				steps: template,
+				maps: loopMaps,
+				result,
+				maxIterations,
+			})
+			return createReference(id) as never
+		},
 	}
 	const result = definition.flow(builder)
+	const validateSteps = (
+		label: string,
+		current: readonly Step[],
+		allowed: ReadonlySet<string>,
+	) => {
+		const ids = new Set(current.map((step) => step.id))
+		const visiting = new Set<string>()
+		const visited = new Set<string>()
+		const visit = (id: string, path: string[]): void => {
+			if (visiting.has(id))
+				throw new Error(
+					`Flow graph contains a cycle in ${label}: ${[...path, id].join(' -> ')}.`,
+				)
+			if (visited.has(id)) return
+			visiting.add(id)
+			const step = current.find((candidate) => candidate.id === id)
+			if (step) {
+				const references = new Set([
+					...dependencies(step.input),
+					...step.conditions.flatMap((condition) => [
+						...dependencies(condition.value),
+					]),
+				])
+				for (const reference of references) {
+					if (ids.has(reference)) visit(reference, [...path, id])
+					else if (!allowed.has(reference))
+						throw new Error(
+							`Flow graph references unknown node "${reference}" in ${label}.`,
+						)
+				}
+			}
+			visiting.delete(id)
+			visited.add(id)
+		}
+		for (const id of ids) visit(id, [])
+	}
+	const mainOutputs = new Set([
+		'$input',
+		...steps.map((step) => step.id),
+		...maps.map((map) => map.id),
+		...loops.map((loop) => loop.id),
+	])
+	const stepReferences = (current: readonly Step[]) =>
+		current.flatMap((step) => [
+			...dependencies(step.input),
+			...step.conditions.flatMap((condition) => [
+				...dependencies(condition.value),
+			]),
+		])
+	const graph = new Map<string, Set<string>>(
+		steps.map((step) => [step.id, new Set(stepReferences([step]))]),
+	)
+	for (const map of maps) {
+		const local = new Set([
+			...map.steps.map((step) => step.id),
+			'$map:item',
+			'$map:index',
+		])
+		graph.set(
+			map.id,
+			new Set(
+				[...dependencies(map.items), ...stepReferences(map.steps)].filter(
+					(reference) => !local.has(reference),
+				),
+			),
+		)
+	}
+	for (const loop of loops) {
+		const local = new Set([
+			...loop.steps.map((step) => step.id),
+			...loop.maps.map((map) => map.id),
+			'$loop:state',
+			'$loop:iteration',
+			'$map:item',
+			'$map:index',
+		])
+		graph.set(
+			loop.id,
+			new Set(
+				[
+					...dependencies(loop.initial),
+					...loop.conditions.flatMap((condition) => [
+						...dependencies(condition.value),
+					]),
+					...stepReferences(loop.steps),
+					...loop.maps.flatMap((map) => [
+						...dependencies(map.items),
+						...stepReferences(map.steps),
+					]),
+				].filter((reference) => !local.has(reference)),
+			),
+		)
+	}
+	const visiting = new Set<string>()
+	const visited = new Set<string>()
+	const visitGraph = (id: string, path: string[]): void => {
+		if (visiting.has(id))
+			throw new Error(
+				`Flow graph contains a cycle: ${[...path, id].join(' -> ')}.`,
+			)
+		if (visited.has(id)) return
+		visiting.add(id)
+		for (const dependency of graph.get(id) ?? [])
+			if (graph.has(dependency)) visitGraph(dependency, [...path, id])
+		visiting.delete(id)
+		visited.add(id)
+	}
+	for (const id of graph.keys()) visitGraph(id, [])
+	validateSteps(
+		'flow',
+		steps,
+		new Set([
+			'$input',
+			...maps.map((map) => map.id),
+			...loops.map((loop) => loop.id),
+		]),
+	)
+	for (const map of maps) {
+		for (const reference of dependencies(map.items))
+			if (!mainOutputs.has(reference))
+				throw new Error(
+					`Flow graph references unknown node "${reference}" in map "${map.id}".`,
+				)
+		validateSteps(
+			`map "${map.id}"`,
+			map.steps,
+			new Set([...mainOutputs, '$map:item', '$map:index']),
+		)
+	}
+	for (const loop of loops) {
+		for (const reference of dependencies(loop.initial))
+			if (!mainOutputs.has(reference))
+				throw new Error(
+					`Flow graph references unknown node "${reference}" in loop "${loop.id}".`,
+				)
+		const loopOutputs = new Set([
+			...mainOutputs,
+			...loop.maps.map((map) => map.id),
+			'$loop:state',
+			'$loop:iteration',
+		])
+		validateSteps(`loop "${loop.id}"`, loop.steps, loopOutputs)
+		for (const map of loop.maps) {
+			for (const reference of dependencies(map.items))
+				if (
+					!loopOutputs.has(reference) &&
+					!loop.steps.some((step) => step.id === reference)
+				)
+					throw new Error(
+						`Flow graph references unknown node "${reference}" in map "${map.id}" in loop "${loop.id}".`,
+					)
+			validateSteps(
+				`map "${map.id}" in loop "${loop.id}"`,
+				map.steps,
+				new Set([
+					...loopOutputs,
+					...loop.steps.map((step) => step.id),
+					'$map:item',
+					'$map:index',
+				]),
+			)
+		}
+	}
+	for (const reference of dependencies(result))
+		if (!mainOutputs.has(reference))
+			throw new Error(
+				`Flow graph references unknown node "${reference}" in flow output.`,
+			)
 	const plan: Plan = {
 		id: definition.id,
 		...(definition.input ? { input: definition.input } : {}),
 		...(definition.output ? { output: definition.output } : {}),
 		steps,
 		maps,
+		loops,
 		result,
 	}
 	return {
