@@ -39,6 +39,14 @@
 			},
 			"import": "./dist/bullmq/index.js",
 			"require": "./dist/bullmq/index.cjs"
+		},
+		"./bullmq/postgres": {
+			"types": {
+				"import": "./dist/bullmq/postgres/index.d.ts",
+				"require": "./dist/bullmq/postgres/index.d.cts"
+			},
+			"import": "./dist/bullmq/postgres/index.js",
+			"require": "./dist/bullmq/postgres/index.cjs"
 		}
 	},
 	"repository": {
@@ -97,10 +105,14 @@
 		"unrun": "0.3.1"
 	},
 	"peerDependencies": {
-		"bullmq": "^6.3.4"
+		"bullmq": "^6.3.4",
+		"pg": "^8.0.0"
 	},
 	"peerDependenciesMeta": {
 		"bullmq": {
+			"optional": true
+		},
+		"pg": {
 			"optional": true
 		}
 	}

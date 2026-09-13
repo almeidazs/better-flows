@@ -7,6 +7,7 @@ export default defineConfig({
 		index: 'src/index.ts',
 		'memory/index': 'src/runtimes/memory/index.ts',
 		'bullmq/index': 'src/runtimes/bullmq/index.ts',
+		'bullmq/postgres/index': 'src/runtimes/bullmq/postgres/index.ts',
 	},
 	deps: { neverBundle: true },
 	format: ['esm', 'cjs'],

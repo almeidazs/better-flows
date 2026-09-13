@@ -1,4 +1,12 @@
-import { type ConnectionOptions, Queue, QueueEvents, Worker } from 'bullmq'
+import {
+	type BackendFactory,
+	type ConnectionOptions,
+	type IQueueBackend,
+	type Job,
+	Queue,
+	QueueEvents,
+	Worker,
+} from 'bullmq'
 
 import type {
 	Execution,
@@ -16,19 +24,44 @@ interface JobData {
 
 /** Configuration used to connect the BullMQ runtime to Redis. */
 export interface BullMQOptions {
+	/** Redis connection settings accepted by BullMQ. */
 	readonly connection: ConnectionOptions
+	/** Queue namespace. Defaults to `better-flows`. */
 	readonly queueName?: string
 }
 
-class BullMQRuntime implements WorkerRuntime {
-	readonly #queue: Queue<JobData, RunSnapshot>
-	readonly #options: BullMQOptions
+interface SharedBullMQOptions {
+	readonly connection: unknown
+	readonly queueName?: string
+}
 
-	constructor(options: BullMQOptions) {
+/** A BullMQ runtime with an explicit resource cleanup method. */
+export type BullMQRuntime = Runtime &
+	WorkerRuntime & {
+		/** Closes the underlying BullMQ queue connection. */
+		close(): Promise<void>
+	}
+
+class BullMQAdapter implements WorkerRuntime {
+	readonly #queue: Queue<JobData, RunSnapshot>
+	readonly #options: SharedBullMQOptions
+	readonly #backendFactory: BackendFactory<IQueueBackend> | undefined
+
+	constructor(
+		options: SharedBullMQOptions,
+		backendFactory?: BackendFactory<IQueueBackend>,
+	) {
 		this.#options = options
-		this.#queue = new Queue(options.queueName ?? 'better-flows', {
-			connection: options.connection,
-		})
+		this.#backendFactory = backendFactory
+		this.#queue = backendFactory
+			? new Queue(
+					options.queueName ?? 'better-flows',
+					{ connection: options.connection } as never,
+					backendFactory as never,
+				)
+			: new Queue(options.queueName ?? 'better-flows', {
+					connection: options.connection,
+				} as never)
 	}
 
 	async start(execution: Execution): Promise<string> {
@@ -69,15 +102,21 @@ class BullMQRuntime implements WorkerRuntime {
 		const job = await this.#queue.getJob(id)
 		if (!job) throw new Error(`Run "${id}" was not found.`)
 		if (job.data.cancelled) return { id, status: 'cancelled', nodes: {} }
-		const events = new QueueEvents(this.#options.queueName ?? 'better-flows', {
-			connection: this.#options.connection,
-		})
+		const events = this.#backendFactory
+			? new QueueEvents(
+					this.#options.queueName ?? 'better-flows',
+					{ connection: this.#options.connection } as never,
+					this.#backendFactory as never,
+				)
+			: new QueueEvents(this.#options.queueName ?? 'better-flows', {
+					connection: this.#options.connection,
+				} as never)
 		try {
 			await job.waitUntilFinished(events)
-		} catch {
+		} catch (error) {
 			const result = await this.get(id)
-			if (result) return result
-			throw new Error(`Run "${id}" was not found.`)
+			if (result && result.status !== 'running') return result
+			throw error
 		} finally {
 			await events.close()
 		}
@@ -97,46 +136,62 @@ class BullMQRuntime implements WorkerRuntime {
 	}
 
 	worker(processor: FlowProcessor): { close(): Promise<void> } {
-		const worker = new Worker<JobData, RunSnapshot>(
-			this.#options.queueName ?? 'better-flows',
-			async (job) => {
-				if (!job.id) throw new Error('BullMQ job is missing an id.')
-				const jobId = job.id
-				if (job.data.cancelled)
-					return { id: jobId, status: 'cancelled', nodes: {} }
-				const controller = new AbortController()
-				const cancellationPoll = setInterval(() => {
-					void this.#queue
-						.getJob(jobId)
-						.then((current) => {
-							if (current?.data.cancelled) controller.abort()
-						})
-						.catch(() => controller.abort())
-				}, 100)
-				try {
-					return await processor(
-						job.data.flowId,
-						job.data.input,
-						jobId,
-						(result) => job.updateProgress(result),
-						controller.signal,
-					)
-				} finally {
-					clearInterval(cancellationPoll)
-				}
-			},
-			{ connection: this.#options.connection },
-		)
+		const runJob = async (job: Job<JobData, RunSnapshot>) => {
+			if (!job.id) throw new Error('BullMQ job is missing an id.')
+			const jobId = job.id
+			if (job.data.cancelled)
+				return { id: jobId, status: 'cancelled', nodes: {} } as RunSnapshot
+			const controller = new AbortController()
+			const cancellationPoll = setInterval(() => {
+				void this.#queue
+					.getJob(jobId)
+					.then((current) => {
+						if (current?.data.cancelled) controller.abort()
+					})
+					.catch(() => controller.abort())
+			}, 100)
+			try {
+				return await processor(
+					job.data.flowId,
+					job.data.input,
+					jobId,
+					(result) => job.updateProgress(result),
+					controller.signal,
+				)
+			} finally {
+				clearInterval(cancellationPoll)
+			}
+		}
+		const worker = this.#backendFactory
+			? new Worker<JobData, RunSnapshot>(
+					this.#options.queueName ?? 'better-flows',
+					runJob,
+					{ connection: this.#options.connection } as never,
+					this.#backendFactory as never,
+				)
+			: new Worker<JobData, RunSnapshot>(
+					this.#options.queueName ?? 'better-flows',
+					runJob,
+					{ connection: this.#options.connection } as never,
+				)
 		return worker
 	}
 }
 
+/** @internal Creates a runtime with a selected BullMQ storage backend. */
+export function createBullMQRuntime(
+	options: SharedBullMQOptions,
+	backendFactory?: BackendFactory<IQueueBackend>,
+): BullMQRuntime {
+	return new BullMQAdapter(options, backendFactory)
+}
+
 /**
- * Creates a BullMQ-backed runtime for durable queued workflow execution.
+ * Creates a Redis-backed BullMQ runtime for durable queued workflow execution.
  *
  * Start a worker with `flows.worker()` in a process that imports and registers
  * the same flow definitions. Call `close()` when the producer is shut down.
  */
-export function bullmq(options: BullMQOptions): Runtime & WorkerRuntime {
-	return new BullMQRuntime(options)
+export function bullmq(options: BullMQOptions): BullMQRuntime {
+	return createBullMQRuntime(options)
 }

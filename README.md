@@ -149,6 +149,7 @@ fully typed inside `run()`, and `map()` is supported within an iteration.
 
 - [Memory](src/runtimes/memory/README.md) — fast, process-local execution for tests and development.
 - [BullMQ](src/runtimes/bullmq/README.md) — Redis-backed producer and worker execution.
+- [BullMQ PostgreSQL](src/runtimes/bullmq/postgres/README.md) — BullMQ execution backed by PostgreSQL.
 
 ## Lifecycle hooks
 
