@@ -18,6 +18,7 @@ export { definePlugin } from './plugins'
 export type {
 	NodeRun,
 	NodeStatus,
+	RunNodes,
 	RunSnapshot,
 	RunStatus,
 	Runtime,

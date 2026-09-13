@@ -39,6 +39,7 @@ export type {
 	FlowProcessor,
 	NodeRun,
 	NodeStatus,
+	RunNodes,
 	RunSnapshot,
 	RunStatus,
 	Runtime,

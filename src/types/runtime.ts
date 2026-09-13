@@ -1,4 +1,5 @@
 import type { Plan } from './internal'
+import type { AnyNode, NodeOutput } from './node'
 
 /** The lifecycle state of a workflow run. */
 export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled'
@@ -7,20 +8,37 @@ export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled'
 export type NodeStatus = RunStatus | 'pending' | 'skipped'
 
 /** Recorded execution state for a node. */
-export interface NodeRun {
+export interface NodeRun<TOutput = unknown> {
 	readonly status: NodeStatus
-	readonly output?: unknown
+	readonly output?: TOutput
 	readonly error?: string
 	readonly attempts: number
 }
 
+/** Resolves an unknown output for broad node constraints. */
+type RegisteredNodeOutput<TNode> = [NodeOutput<TNode>] extends [never]
+	? unknown
+	: NodeOutput<TNode>
+
+/** Node states addressable through a Better Flows node registry. */
+export type RunNodes<TNodes extends Record<string, AnyNode>> = Readonly<
+	Record<string, NodeRun>
+> & {
+	readonly [TNodeName in keyof TNodes]: NodeRun<
+		RegisteredNodeOutput<TNodes[TNodeName]>
+	>
+}
+
 /** Serializable workflow run state returned by runtimes. */
-export interface RunSnapshot {
+export interface RunSnapshot<
+	TNodes extends Record<string, AnyNode> = Record<string, AnyNode>,
+> {
 	readonly id: string
 	readonly status: RunStatus
 	readonly output?: unknown
 	readonly error?: string
-	readonly nodes: Readonly<Record<string, NodeRun>>
+	/** Latest state for each node invocation in this run. */
+	readonly nodes: RunNodes<TNodes>
 }
 
 /** Internal execution payload supplied to a runtime. */

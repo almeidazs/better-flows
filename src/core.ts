@@ -73,9 +73,9 @@ export interface BetterFlows<
 	): Promise<RunHandle<TOutput>>
 	/** Queries snapshots by run ID. */
 	readonly runs: {
-		/** Returns the latest snapshot for a run. */ get(
+		/** Returns the latest snapshot for a run, including typed node outputs. */ get(
 			id: string,
-		): Promise<RunSnapshot | undefined>
+		): Promise<RunSnapshot<TNodes>>
 	}
 	/** Registered nodes. */
 	readonly nodes: TNodes
@@ -272,7 +272,15 @@ export function betterFlows<
 			return flow as Flow<TInput, TOutput>
 		},
 		run: start,
-		runs: { get: (id: string) => options.runtime.get(id) },
+		runs: {
+			async get(id: string) {
+				const result = await options.runtime.get(id)
+
+				if (!result) throw new Error(`Run "${id}" was not found.`)
+
+				return result as RunSnapshot<TNodes>
+			},
+		},
 		nodes: options.nodes,
 		plugins: pluginApi,
 		worker() {

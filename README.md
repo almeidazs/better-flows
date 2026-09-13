@@ -70,6 +70,15 @@ const result = await run.wait()
 `scored.score` is known as a number. `scored.foo` is a TypeScript error before
 the workflow executes.
 
+Inspect a live run at any time:
+
+```ts
+const result = await flows.runs.get(run.id)
+
+result.status // "running" | "completed" | "failed" | "cancelled"
+result.nodes.scoreLead.output // { score: number } | undefined
+```
+
 ## Conditional paths
 
 Use `when()` for one runtime predicate, `branch()` for ordered predicates, and

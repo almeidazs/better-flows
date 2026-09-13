@@ -323,7 +323,10 @@ test('invokes native and plugin hooks and exposes a running snapshot', async () 
 		flow: ({ node }) => node(slow, undefined),
 	})
 	const run = await flow.run(undefined)
-	expect((await flows.runs.get(run.id))?.status).toBe('running')
+	const snapshot = await flows.runs.get(run.id)
+	expect(snapshot.status).toBe('running')
+	const output: string | undefined = snapshot.nodes.slow.output
+	expect(output).toBeUndefined()
 	expect((await run.wait()).output).toBe('done')
 	expect(events.some((event) => event === 'slow:start')).toBe(true)
 	expect(events.some((event) => event === 'slow:complete:plugin')).toBe(true)
