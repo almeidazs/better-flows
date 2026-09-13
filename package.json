@@ -23,6 +23,22 @@
 			"import": "./dist/index.js",
 			"require": "./dist/index.cjs",
 			"default": "./dist/index.js"
+		},
+		"./memory": {
+			"types": {
+				"import": "./dist/memory/index.d.ts",
+				"require": "./dist/memory/index.d.cts"
+			},
+			"import": "./dist/memory/index.js",
+			"require": "./dist/memory/index.cjs"
+		},
+		"./bullmq": {
+			"types": {
+				"import": "./dist/bullmq/index.d.ts",
+				"require": "./dist/bullmq/index.d.cts"
+			},
+			"import": "./dist/bullmq/index.js",
+			"require": "./dist/bullmq/index.cjs"
 		}
 	},
 	"repository": {
@@ -71,11 +87,20 @@
 		"@biomejs/biome": "2.5.12",
 		"@commitlint/cli": "^21.1.0",
 		"@commitlint/config-conventional": "^21.1.0",
+		"@standard-schema/spec": "^1.1.0",
 		"@types/bun": "1.4.0",
 		"lefthook": "^1.11.14",
 		"publint": "^0.3.15",
 		"tsdown": "0.23.0",
 		"typescript": "^5.9.2",
 		"unrun": "0.3.1"
+	},
+	"peerDependencies": {
+		"bullmq": "^6.3.4"
+	},
+	"peerDependenciesMeta": {
+		"bullmq": {
+			"optional": true
+		}
 	}
 }

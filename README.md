@@ -1,0 +1,81 @@
+# Better Flows
+
+**Type-safe workflows for TypeScript.**
+
+Better Flows gives application workflows a small, typed model: compose normal
+functions into a graph, validate boundaries at runtime, and run the same flow
+in memory or with a production runtime. It is built for lead qualification,
+provisioning, billing, notifications, and AI pipelines.
+
+```bash
+npm install better-flows zod
+```
+
+## Why
+
+Queues move jobs; Better Flows models the work itself.
+
+- Node outputs are inferred and checked before code reaches production.
+- Dependencies are inferred, so independent work runs concurrently.
+- Retries, timeouts, cancellation, branches, and run snapshots are built in.
+- Runtimes are replaceable: use memory in tests and BullMQ in production.
+- Plugins keep observability and infrastructure out of business logic.
+
+## A real workflow
+
+```ts
+import { betterFlows, defineNode } from 'better-flows'
+import { memory } from 'better-flows/memory'
+import { z } from 'zod'
+
+const fetchLead = defineNode({
+	input: z.object({ leadId: z.string() }),
+	output: z.object({ leadId: z.string(), email: z.string() }),
+	run: async ({ input }) => db.leads.get(input.leadId),
+})
+
+const scoreLead = defineNode({
+	input: z.object({ leadId: z.string() }),
+	output: z.object({ score: z.number() }),
+	retry: { attempts: 3, backoff: 'exponential' },
+	run: async ({ input }) => scoring.score(input.leadId),
+})
+
+const sendEmail = defineNode({
+	input: z.object({ email: z.string(), score: z.number() }),
+	run: async ({ input }) => mailer.send(input),
+})
+
+const flows = betterFlows({
+	runtime: memory(),
+	nodes: { fetchLead, scoreLead, sendEmail },
+})
+
+const qualifyLead = flows.defineFlow({
+	id: 'qualify-lead',
+	input: z.object({ leadId: z.string() }),
+	flow: ({ input, node }) => {
+    		const lead = node(fetchLead, input)
+      	const scored = node(scoreLead, { leadId: lead.leadId })
+
+        	return node(sendEmail, { email: lead.email, score: scored.score })
+  	},
+})
+
+const run = await qualifyLead.run({ leadId: 'lead_123' })
+
+const result = await run.wait()
+```
+
+`scored.score` is known as a number. `scored.foo` is a TypeScript error before
+the workflow executes.
+
+## Runtimes
+
+- [Memory](src/runtimes/memory/README.md) — fast, process-local execution for tests and development.
+- [BullMQ](src/runtimes/bullmq/README.md) — Redis-backed producer and worker execution.
+
+## Plugins
+
+Use plugins for tracing, metrics, audit logs, and shared services. They receive
+run and node lifecycle hooks, while nodes remain focused on business work.

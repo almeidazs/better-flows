@@ -3,7 +3,11 @@ import { defineConfig } from 'tsdown'
 export default defineConfig({
 	clean: true,
 	dts: true,
-	entry: ['src/index.ts'],
+	entry: {
+		index: 'src/index.ts',
+		'memory/index': 'src/runtimes/memory/index.ts',
+		'bullmq/index': 'src/runtimes/bullmq/index.ts',
+	},
 	deps: { neverBundle: true },
 	format: ['esm', 'cjs'],
 	minify: false,
