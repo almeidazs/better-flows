@@ -47,6 +47,22 @@
 			},
 			"import": "./dist/bullmq/postgres/index.js",
 			"require": "./dist/bullmq/postgres/index.cjs"
+		},
+		"./cron": {
+			"types": {
+				"import": "./dist/cron/index.d.ts",
+				"require": "./dist/cron/index.d.cts"
+			},
+			"import": "./dist/cron/index.js",
+			"require": "./dist/cron/index.cjs"
+		},
+		"./triggers": {
+			"types": {
+				"import": "./dist/triggers/index.d.ts",
+				"require": "./dist/triggers/index.d.cts"
+			},
+			"import": "./dist/triggers/index.js",
+			"require": "./dist/triggers/index.cjs"
 		}
 	},
 	"repository": {
@@ -115,5 +131,8 @@
 		"pg": {
 			"optional": true
 		}
+	},
+	"dependencies": {
+		"croner": "^10.0.1"
 	}
 }

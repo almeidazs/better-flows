@@ -6,8 +6,11 @@ import {
 	definePlugin,
 	type NodeOutput,
 	type Schema,
+	type TriggerSetupContext,
 } from '../src'
+import { cron } from '../src/cron'
 import { memory } from '../src/runtimes/memory'
+import { defineTrigger } from '../src/triggers'
 
 function schema<T>(): Schema<unknown, T> {
 	return {
@@ -18,6 +21,146 @@ function schema<T>(): Schema<unknown, T> {
 		},
 	}
 }
+
+test('starts flows from typed custom triggers and preserves occurrences', async () => {
+	let emit:
+		| TriggerSetupContext<
+				{ readonly reportId: string },
+				{ readonly reportId: string; readonly source: 'event' }
+		  >['emit']
+		| undefined
+	let disposed = false
+	const reportRequested = defineTrigger({
+		type: 'event',
+		id: 'report-requested',
+		input: (occurrence: {
+			readonly payload: { readonly reportId: string }
+		}) => ({
+			reportId: occurrence.payload.reportId,
+			source: 'event' as const,
+		}),
+		setup: (context) => {
+			emit = context.emit
+		},
+		dispose: () => {
+			disposed = true
+		},
+	})
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: {},
+		triggers: [{ flow: 'build-report', trigger: reportRequested }],
+	})
+	flows.defineFlow<
+		{ readonly reportId: string; readonly source: 'event' },
+		{ readonly reportId: string; readonly source: 'event' }
+	>({
+		id: 'build-report',
+		flow: ({ input }) => input,
+	})
+	await flows.triggers.start()
+	if (!emit) throw new Error('Trigger was not installed.')
+	const run = await emit(
+		{ reportId: 'report_123' },
+		{ metadata: { source: 'test' } },
+	)
+	const result = await run.wait()
+	expect(result.output).toEqual({ reportId: 'report_123', source: 'event' })
+	expect(result.trigger).toMatchObject({
+		trigger: { id: 'report-requested', type: 'event' },
+		flow: { id: 'build-report' },
+		payload: { reportId: 'report_123' },
+		metadata: { source: 'test' },
+	})
+	expect(result.trigger?.occurredAt).toBeInstanceOf(Date)
+	expect((await flows.runs.get(run.id)).trigger?.id).toBe(result.trigger?.id)
+	await flows.triggers.stop()
+	expect(disposed).toBe(true)
+	await expect(emit({ reportId: 'report_456' })).rejects.toThrow('not active')
+})
+
+test('starts flow-local triggers once and allows them to be restarted', async () => {
+	let setups = 0
+	let disposals = 0
+	const manual = defineTrigger({
+		type: 'manual',
+		input: () => 42,
+		setup: () => {
+			setups++
+		},
+		dispose: () => {
+			disposals++
+		},
+	})
+	const flows = betterFlows({ runtime: memory(), nodes: {} })
+	flows.defineFlow<number, number>({
+		id: 'flow-local-trigger',
+		triggers: [manual],
+		flow: ({ input }) => input,
+	})
+	await Promise.all([flows.triggers.start(), flows.triggers.start()])
+	expect(setups).toBe(1)
+	await flows.triggers.stop()
+	expect(disposals).toBe(1)
+	await flows.triggers.start()
+	expect(setups).toBe(2)
+	await flows.triggers.stop()
+	expect(disposals).toBe(2)
+})
+
+test('rejects reusing one trigger instance for multiple flow registrations', async () => {
+	const manual = defineTrigger({ type: 'manual', input: () => undefined })
+	const flows = betterFlows({
+		runtime: memory(),
+		nodes: {},
+		triggers: [
+			{ flow: 'first', trigger: manual },
+			{ flow: 'second', trigger: manual },
+		],
+	})
+	flows.defineFlow<undefined, undefined>({
+		id: 'first',
+		flow: ({ input }) => input,
+	})
+	flows.defineFlow<undefined, undefined>({
+		id: 'second',
+		flow: ({ input }) => input,
+	})
+	await expect(flows.triggers.start()).rejects.toThrow(
+		'cannot be attached more than once',
+	)
+})
+
+test('starts cron triggers with UTC scheduling and typed input', async () => {
+	let executions = 0
+	const record = defineNode<{ readonly source: 'cron' }, undefined>({
+		id: 'record-cron-run',
+		run: ({ input }) => {
+			expect(input).toEqual({ source: 'cron' })
+			executions++
+			return undefined
+		},
+	})
+	const flows = betterFlows({ runtime: memory(), nodes: { record } })
+	flows.defineFlow<{ readonly source: 'cron' }, undefined>({
+		id: 'cron-flow',
+		triggers: [
+			cron('* * * * * *', {
+				context: { source: 'croner' },
+				input: ({ payload }) => {
+					expect(payload).toEqual({ source: 'croner' })
+					return { source: 'cron' as const }
+				},
+				maxRuns: 1,
+			}),
+		],
+		flow: ({ input, node }) => node(record, input),
+	})
+	await flows.triggers.start()
+	await Bun.sleep(1_500)
+	await flows.triggers.stop()
+	expect(executions).toBe(1)
+})
 
 test('preserves schema output types for downstream code', () => {
 	const enrich = defineNode({

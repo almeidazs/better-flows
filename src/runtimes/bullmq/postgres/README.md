@@ -20,5 +20,5 @@ const runtime = postgres({
 
 Producers enqueue with `flows.run(flow, input)`. In a worker process, import
 the module that registers the same nodes and flows, then start `flows.worker()`.
-Inputs must be JSON-serializable. Call `runtime.close()` when a long-lived
-producer shuts down.
+Inputs and trigger occurrence `payload`/`metadata` must be JSON-serializable.
+Call `runtime.close()` when a long-lived producer shuts down.

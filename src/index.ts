@@ -25,6 +25,15 @@ export type {
 	WorkerRuntime,
 } from './runtimes'
 export type {
+	Trigger,
+	TriggerContext,
+	TriggerDefinition,
+	TriggerManager,
+	TriggerOccurrence,
+	TriggerRegistration,
+	TriggerSetupContext,
+} from './triggers'
+export type {
 	HookErrorEvent,
 	HookName,
 	HookResult,

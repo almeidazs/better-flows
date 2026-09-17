@@ -10,7 +10,7 @@ import {
 } from '../internal'
 import type { AnyNode, NodeInput, NodeOutput } from '../nodes'
 import type { RunSnapshot } from '../runtimes'
-import type { Schema } from '../types'
+import type { Schema, Trigger } from '../types'
 
 /** Builder supplied while a flow is being compiled into a dependency graph. */
 export interface FlowBuilder {
@@ -77,6 +77,8 @@ export interface FlowDefinition<TInput, TOutput> {
 	readonly id: string
 	readonly input?: Schema<unknown, TInput>
 	readonly output?: Schema<unknown, TOutput>
+	/** Triggers that can start this flow once `flows.triggers.start()` is called. */
+	readonly triggers?: readonly Trigger<string, never, TInput>[]
 	readonly flow: (builder: FlowBuilder & { readonly input: TInput }) => TOutput
 }
 
@@ -97,6 +99,8 @@ export interface RunHandle<TOutput> {
 	status: RunSnapshot['status']
 	output?: TOutput
 	nodes: RunSnapshot['nodes']
+	/** Trigger occurrence that started this run, when applicable. */
+	trigger?: RunSnapshot['trigger']
 	/** Waits for completion and returns the terminal run snapshot. */
 	wait(): Promise<RunSnapshot & { readonly output?: TOutput }>
 	/** Requests cooperative cancellation for this run. */

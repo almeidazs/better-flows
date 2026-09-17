@@ -79,6 +79,34 @@ result.status // "running" | "completed" | "failed" | "cancelled"
 result.nodes.scoreLead.output // { score: number } | undefined
 ```
 
+## Scheduled flows
+
+Triggers keep scheduling at the edge of a workflow: each occurrence becomes a
+normal, observable run. `cron()` uses UTC by default, so a deployment's local
+timezone never changes the schedule.
+
+```ts
+import { cron } from 'better-flows/cron'
+
+const dailyReport = flows.defineFlow({
+	id: 'daily-report',
+	triggers: [
+		cron('0 9 * * *', {
+			timezone: 'America/Sao_Paulo',
+			input: () => ({ source: 'daily-cron' as const }),
+		}),
+	],
+	flow: ({ input, node }) => node(sendReport, input),
+})
+
+await flows.triggers.start()
+```
+
+Create triggers for webhooks, events, or any external scheduler with
+`defineTrigger()` from `better-flows/triggers`. See the
+[cron runtime guide](src/cron/README.md) for scheduling options and deployment
+guidance.
+
 ## Conditional paths
 
 Use `when()` for one runtime predicate, `branch()` for ordered predicates, and

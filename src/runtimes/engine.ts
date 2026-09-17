@@ -19,12 +19,14 @@ function snapshot(
 	nodes: Map<string, NodeRun>,
 	output?: unknown,
 	error?: string,
+	trigger?: RunSnapshot['trigger'],
 ): RunSnapshot {
 	return {
 		id,
 		status,
 		...(output === undefined ? {} : { output }),
 		...(error ? { error } : {}),
+		...(trigger ? { trigger } : {}),
 		nodes: Object.fromEntries(nodes),
 	}
 }
@@ -302,6 +304,7 @@ export async function executePlan(
 	update: (snapshot: RunSnapshot) => Promise<void> | void,
 	signal: AbortSignal,
 	hooks?: EngineHooks,
+	trigger?: RunSnapshot['trigger'],
 ): Promise<RunSnapshot> {
 	const nodes = new Map<string, NodeRun>([
 		...plan.steps.map(
@@ -327,7 +330,7 @@ export async function executePlan(
 	const active = new Map<Promise<void>, Step>()
 	const activeMaps = new Map<string, number>()
 	const publish = async (status: RunSnapshot['status'] = 'running') =>
-		update(snapshot(id, status, nodes))
+		update(snapshot(id, status, nodes, undefined, undefined, trigger))
 	await publish()
 	const runStep = async (step: Step) => {
 		const nodeContext = {
@@ -655,7 +658,7 @@ export async function executePlan(
 			await publish()
 		}
 		const output = await validate(plan.output, resolve(plan.result, outputs))
-		const result = snapshot(id, 'completed', nodes, output)
+		const result = snapshot(id, 'completed', nodes, output, undefined, trigger)
 		await update(result)
 		return result
 	} catch (error) {
@@ -688,6 +691,7 @@ export async function executePlan(
 				: error instanceof Error
 					? error.message
 					: String(error),
+			trigger,
 		)
 		await update(result)
 		if (cancelled) {

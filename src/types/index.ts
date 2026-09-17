@@ -46,3 +46,13 @@ export type {
 	WorkerRuntime,
 } from './runtime'
 export type { InferSchemaInput, InferSchemaOutput, Schema } from './schema'
+export type {
+	AnyTrigger,
+	Trigger,
+	TriggerContext,
+	TriggerDefinition,
+	TriggerManager,
+	TriggerOccurrence,
+	TriggerRegistration,
+	TriggerSetupContext,
+} from './trigger'

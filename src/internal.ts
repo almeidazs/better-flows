@@ -4,6 +4,7 @@ import type { Reference } from './types/internal'
 export const nodeBrand = Symbol('better-flows.node')
 export const flowBrand = Symbol('better-flows.flow')
 export const referenceBrand = Symbol('better-flows.reference')
+export const triggerBrand = Symbol('better-flows.trigger')
 
 export type {
 	EngineHooks,

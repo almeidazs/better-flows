@@ -7,7 +7,7 @@ import {
 	QueueEvents,
 	Worker,
 } from 'bullmq'
-
+import type { TriggerOccurrence } from '../../types'
 import type {
 	Execution,
 	FlowProcessor,
@@ -16,10 +16,46 @@ import type {
 	WorkerRuntime,
 } from '..'
 
+type StoredTrigger = Omit<TriggerOccurrence, 'occurredAt'> & {
+	readonly occurredAt: string
+}
+
 interface JobData {
 	readonly flowId: string
 	readonly input: unknown
 	readonly cancelled?: boolean
+	readonly trigger?: StoredTrigger
+}
+
+function serializeTrigger(
+	trigger: TriggerOccurrence | undefined,
+): StoredTrigger | undefined {
+	return trigger && { ...trigger, occurredAt: trigger.occurredAt.toISOString() }
+}
+
+function restoreTrigger(
+	trigger: StoredTrigger | undefined,
+): TriggerOccurrence | undefined {
+	return trigger && { ...trigger, occurredAt: new Date(trigger.occurredAt) }
+}
+
+function restoreSnapshot(
+	snapshot: RunSnapshot,
+	trigger?: StoredTrigger,
+): RunSnapshot {
+	const occurrence = snapshot.trigger ?? restoreTrigger(trigger)
+	if (!occurrence) return snapshot
+	return {
+		...snapshot,
+		trigger: {
+			...occurrence,
+			occurredAt: new Date(
+				occurrence.occurredAt instanceof Date
+					? occurrence.occurredAt.getTime()
+					: occurrence.occurredAt,
+			),
+		},
+	}
 }
 
 /** Configuration used to connect the BullMQ runtime to Redis. */
@@ -65,9 +101,14 @@ class BullMQAdapter implements WorkerRuntime {
 	}
 
 	async start(execution: Execution): Promise<string> {
+		const trigger = serializeTrigger(execution.trigger)
 		const job = await this.#queue.add(
 			execution.plan.id,
-			{ flowId: execution.plan.id, input: execution.input },
+			{
+				flowId: execution.plan.id,
+				input: execution.input,
+				...(trigger ? { trigger } : {}),
+			},
 			{ attempts: 1, jobId: execution.id },
 		)
 		if (!job.id) throw new Error('BullMQ did not return a job id.')
@@ -77,31 +118,43 @@ class BullMQAdapter implements WorkerRuntime {
 	async get(id: string): Promise<RunSnapshot | undefined> {
 		const job = await this.#queue.getJob(id)
 		if (!job) return undefined
-		if (job.data.cancelled) return { id, status: 'cancelled', nodes: {} }
+		if (job.data.cancelled)
+			return restoreSnapshot(
+				{ id, status: 'cancelled', nodes: {} },
+				job.data.trigger,
+			)
 		const state = await job.getState()
 		const progress =
 			typeof job.progress === 'object' && job.progress !== null
 				? (job.progress as RunSnapshot)
 				: undefined
-		if (job.returnvalue) return job.returnvalue
-		return (
-			progress ?? {
-				id,
-				status:
-					state === 'completed'
-						? 'completed'
-						: state === 'failed'
-							? 'failed'
-							: 'running',
-				nodes: {},
-			}
-		)
+		if (job.returnvalue)
+			return restoreSnapshot(job.returnvalue, job.data.trigger)
+		return progress
+			? restoreSnapshot(progress, job.data.trigger)
+			: restoreSnapshot(
+					{
+						id,
+						status:
+							state === 'completed'
+								? 'completed'
+								: state === 'failed'
+									? 'failed'
+									: 'running',
+						nodes: {},
+					},
+					job.data.trigger,
+				)
 	}
 
 	async wait(id: string): Promise<RunSnapshot> {
 		const job = await this.#queue.getJob(id)
 		if (!job) throw new Error(`Run "${id}" was not found.`)
-		if (job.data.cancelled) return { id, status: 'cancelled', nodes: {} }
+		if (job.data.cancelled)
+			return restoreSnapshot(
+				{ id, status: 'cancelled', nodes: {} },
+				job.data.trigger,
+			)
 		const events = this.#backendFactory
 			? new QueueEvents(
 					this.#options.queueName ?? 'better-flows',
@@ -140,7 +193,10 @@ class BullMQAdapter implements WorkerRuntime {
 			if (!job.id) throw new Error('BullMQ job is missing an id.')
 			const jobId = job.id
 			if (job.data.cancelled)
-				return { id: jobId, status: 'cancelled', nodes: {} } as RunSnapshot
+				return restoreSnapshot(
+					{ id: jobId, status: 'cancelled', nodes: {} },
+					job.data.trigger,
+				)
 			const controller = new AbortController()
 			const cancellationPoll = setInterval(() => {
 				void this.#queue
@@ -157,6 +213,7 @@ class BullMQAdapter implements WorkerRuntime {
 					jobId,
 					(result) => job.updateProgress(result),
 					controller.signal,
+					restoreTrigger(job.data.trigger),
 				)
 			} finally {
 				clearInterval(cancellationPoll)

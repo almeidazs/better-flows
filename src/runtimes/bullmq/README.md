@@ -26,5 +26,6 @@ const worker = flows.worker()
 process.on('SIGTERM', async () => worker.close())
 ```
 
-Inputs must be JSON-serializable. Call `runtime.close()` when a long-lived
-producer shuts down. Cancellation is cooperative: nodes should honor `ctx.signal`.
+Inputs and trigger occurrence `payload`/`metadata` must be JSON-serializable.
+Call `runtime.close()` when a long-lived producer shuts down. Cancellation is
+cooperative: nodes should honor `ctx.signal`.

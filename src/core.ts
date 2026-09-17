@@ -8,7 +8,16 @@ import type { AnyNode } from './nodes'
 import type { PluginApi, PluginDefinition } from './plugins'
 import type { RunSnapshot, Runtime, WorkerRuntime } from './runtimes'
 import { executePlan } from './runtimes/engine'
-import type { HookName, HookResult, Hooks } from './types'
+import type {
+	AnyTrigger,
+	HookName,
+	HookResult,
+	Hooks,
+	Trigger,
+	TriggerManager,
+	TriggerOccurrence,
+	TriggerRegistration,
+} from './types'
 import type { EngineHooks } from './types/internal'
 
 function createHookDispatcher(hooks: readonly Hooks[]) {
@@ -55,6 +64,8 @@ export interface BetterFlowsOptions<
 	}) => TContext | Promise<TContext>
 	/** Optional extensions that provide context, hooks, or a public API. */
 	readonly plugins?: TPlugins
+	/** Centralized trigger registrations, keyed by target flow ID. */
+	readonly triggers?: readonly TriggerRegistration[]
 }
 
 /** Runtime-bound API for defining, running, and inspecting workflows. */
@@ -83,6 +94,8 @@ export interface BetterFlows<
 	readonly plugins: PluginApi<TPlugins>
 	/** Starts a worker when the configured runtime supports workers. */
 	worker(): { close(): Promise<void> }
+	/** Explicit lifecycle controls for configured flow triggers. */
+	readonly triggers: TriggerManager
 }
 
 /**
@@ -119,17 +132,24 @@ export function betterFlows<
 	) as PluginApi<TPlugins>
 
 	const flows = new Map<string, Flow<unknown, unknown>>()
+	let triggerStart: Promise<void> | undefined
+	const activeTriggers: {
+		readonly trigger: AnyTrigger
+		readonly deactivate: () => void
+	}[] = []
 
 	const executionFor = <TInput, TOutput>(
 		flow: Flow<TInput, TOutput>,
 		input: TInput,
 		id: string,
+		trigger?: TriggerOccurrence,
 	) => {
 		return {
 			id,
 			plan: flow.plan,
 			input,
 			context: {},
+			...(trigger ? { trigger } : {}),
 			execute: async (
 				update: (snapshot: RunSnapshot) => Promise<void> | void,
 				signal: AbortSignal,
@@ -164,6 +184,7 @@ export function betterFlows<
 								{ status: 'pending', attempts: 0 },
 							]),
 						),
+						...(trigger ? { trigger } : {}),
 					}
 					await update(result)
 					const event = {
@@ -208,6 +229,7 @@ export function betterFlows<
 					update,
 					signal,
 					nodeHooks,
+					trigger,
 				)
 				const event = {
 					runId: id,
@@ -234,19 +256,22 @@ export function betterFlows<
 	const start = async <TInput, TOutput>(
 		flow: Flow<TInput, TOutput>,
 		input: TInput,
+		trigger?: TriggerOccurrence,
 	): Promise<RunHandle<TOutput>> => {
-		const execution = executionFor(flow, input, crypto.randomUUID())
+		const execution = executionFor(flow, input, crypto.randomUUID(), trigger)
 		const runId = await options.runtime.start(execution)
 		const handle: RunHandle<TOutput> = {
 			id: runId,
 			status: 'running',
 			nodes: {},
+			...(trigger ? { trigger } : {}),
 			async wait() {
 				const result = await options.runtime.wait(runId)
 				handle.status = result.status
 				handle.nodes = result.nodes
 				if (result.output !== undefined)
 					handle.output = result.output as TOutput
+				handle.trigger = result.trigger
 				return result as RunSnapshot & { output?: TOutput }
 			},
 			async cancel() {
@@ -288,16 +313,118 @@ export function betterFlows<
 				throw new Error('The configured runtime does not provide workers.')
 
 			return (options.runtime as WorkerRuntime).worker(
-				async (flowId, input, runId, update, signal) => {
+				async (flowId, input, runId, update, signal, trigger) => {
 					const flow = flows.get(flowId)
 					if (!flow)
 						throw new Error(
 							`Flow "${flowId}" is not registered in this worker process.`,
 						)
-					const execution = executionFor(flow, input, runId)
+					const execution = executionFor(flow, input, runId, trigger)
 					return execution.execute(update, signal)
 				},
 			)
+		},
+		triggers: {
+			async start() {
+				if (triggerStart) return triggerStart
+				triggerStart = (async () => {
+					const registrations = [
+						...(options.triggers ?? []),
+						...[...flows.values()].flatMap((flow) =>
+							(flow.triggers ?? []).map((trigger) => ({
+								flow: flow.id,
+								trigger,
+							})),
+						),
+					]
+					const ids = new Set<string>()
+					const configuredTriggers = new Set<AnyTrigger>()
+					for (const [index, registration] of registrations.entries()) {
+						if (!flows.has(registration.flow))
+							throw new Error(
+								`Trigger target flow "${registration.flow}" is not registered.`,
+							)
+						const triggerId =
+							registration.trigger.id ??
+							`${registration.flow}:${registration.trigger.type}:${index + 1}`
+						const key = `${registration.flow}:${triggerId}`
+						if (ids.has(key))
+							throw new Error(
+								`Trigger "${triggerId}" is configured more than once.`,
+							)
+						ids.add(key)
+						if (configuredTriggers.has(registration.trigger))
+							throw new Error(
+								`Trigger "${triggerId}" cannot be attached more than once. Create a separate trigger for each flow.`,
+							)
+						configuredTriggers.add(registration.trigger)
+					}
+					try {
+						for (const [index, registration] of registrations.entries()) {
+							const trigger = registration.trigger as unknown as Trigger<
+								string,
+								unknown,
+								unknown
+							>
+							const flow = flows.get(registration.flow)
+							if (!flow) continue
+							const triggerId =
+								trigger.id ??
+								`${registration.flow}:${trigger.type}:${index + 1}`
+							let active = true
+							activeTriggers.push({
+								trigger: registration.trigger,
+								deactivate: () => {
+									active = false
+								},
+							})
+							await trigger.setup?.({
+								flow: { id: registration.flow },
+								trigger: { id: triggerId, type: trigger.type },
+								emit: async (payload, triggerOptions) => {
+									if (!active)
+										throw new Error(
+											`Trigger "${triggerId}" is not active. Start triggers before emitting occurrences.`,
+										)
+									const occurrence: TriggerOccurrence = {
+										id: crypto.randomUUID(),
+										trigger: { id: triggerId, type: trigger.type },
+										flow: { id: registration.flow },
+										payload,
+										occurredAt: triggerOptions?.occurredAt ?? new Date(),
+										metadata: triggerOptions?.metadata ?? {},
+									}
+									const input = await trigger.input(occurrence)
+									return start(flow, input, occurrence)
+								},
+							})
+						}
+					} catch (error) {
+						const installed = activeTriggers.splice(0).reverse()
+						for (const trigger of installed) trigger.deactivate()
+						await Promise.allSettled(
+							installed.map(({ trigger }) => trigger.dispose?.()),
+						)
+						throw error
+					}
+				})()
+				try {
+					await triggerStart
+				} catch (error) {
+					triggerStart = undefined
+					throw error
+				}
+			},
+			async stop() {
+				if (!triggerStart) return
+				await triggerStart
+				const installed = activeTriggers.splice(0).reverse()
+				for (const trigger of installed) trigger.deactivate()
+				await Promise.allSettled(
+					installed.map(({ trigger }) => trigger.dispose?.()),
+				)
+				triggerStart = undefined
+			},
 		},
 	}
 }

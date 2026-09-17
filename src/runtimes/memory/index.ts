@@ -12,6 +12,7 @@ class MemoryRuntime implements Runtime {
 		this.#runs.set(id, {
 			id,
 			status: 'running',
+			...(execution.trigger ? { trigger: execution.trigger } : {}),
 			nodes: Object.fromEntries(
 				execution.plan.steps.map((step) => [
 					step.id,

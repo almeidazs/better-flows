@@ -1,5 +1,6 @@
 import type { Plan } from './internal'
 import type { AnyNode, NodeOutput } from './node'
+import type { TriggerOccurrence } from './trigger'
 
 /** The lifecycle state of a workflow run. */
 export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled'
@@ -37,6 +38,8 @@ export interface RunSnapshot<
 	readonly status: RunStatus
 	readonly output?: unknown
 	readonly error?: string
+	/** Trigger occurrence that started this run, when applicable. */
+	readonly trigger?: TriggerOccurrence
 	/** Latest state for each node invocation in this run. */
 	readonly nodes: RunNodes<TNodes>
 }
@@ -47,6 +50,7 @@ export interface Execution {
 	readonly plan: Plan
 	readonly input: unknown
 	readonly context: Record<string, unknown>
+	readonly trigger?: TriggerOccurrence
 	readonly execute: (
 		update: (snapshot: RunSnapshot) => Promise<void> | void,
 		signal: AbortSignal,
@@ -74,6 +78,7 @@ export type FlowProcessor = (
 	runId: string,
 	update: (snapshot: RunSnapshot) => Promise<void> | void,
 	signal: AbortSignal,
+	trigger?: TriggerOccurrence,
 ) => Promise<RunSnapshot>
 
 /** A runtime that can process queued executions in a worker. */
